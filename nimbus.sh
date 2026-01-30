@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# Nimbus: High-Speed Parallel File Transfer (Visual Progress & SSH Multiplex)
+# Nimbus: Multiplexed Parallel File Transfer
 # Usage: ./nimbus.sh <source> <destination> <block_size_mb> <parallel_jobs>
 # ==============================================================================
 
@@ -27,6 +27,9 @@ MAX_RETRIES=5
 
 # --- Validation & Dependencies ---
 if [ "$#" -ne 4 ]; then
+    echo -e "${YELLOW}Nimbus${NC} - Multiplexed parallel file transfer protocol"
+    echo -e "Version: 0.3"
+    echo "" 
     echo -e "${YELLOW}Usage: $0 <source_path> <destination_path> <block_size_mb> <parallel_jobs>${NC}"
     exit 1
 fi
