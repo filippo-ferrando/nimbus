@@ -1,3 +1,5 @@
+![logo](logo.png)
+
 # nimbus
 
 parallel file transfer that uses `cp` and `rsync` to copy files from:
