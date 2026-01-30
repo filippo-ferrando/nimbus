@@ -9,7 +9,7 @@ useful to transfer big file with poor internet connection or session limitations
 
 ## todo
 
- - [ ] progress bar
- - [ ] chunking
- - [ ] resume after failing
+ - [x] progress bar (kinda)
+ - [x] chunking
+ - [x] resume after failing
 
