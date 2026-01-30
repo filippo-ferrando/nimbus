@@ -1,303 +1,234 @@
 #!/bin/bash
 
-# Usage: nimbus.sh <source_path> <destination_path> <block_size_mb> <parallel_jobs>
-# The script detects remote hosts if paths are provided as "user@host:/path"
-# NOTE: This script relies on SSH keys and an active SSH agent for non-interactive
-# authentication to prevent 'scp' from hanging when run in parallel.
+# ==============================================================================
+# Nimbus: High-Speed Parallel File Transfer (Visual Progress & SSH Multiplex)
+# Usage: ./nimbus.sh <source> <destination> <block_size_mb> <parallel_jobs>
+# ==============================================================================
+
+# --- Colors & UI ---
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+log_phase() { echo -e "\n${CYAN}${BOLD}>>> $1${NC}"; }
+log_info()  { echo -e "${NC}    $1"; }
+log_err()   { echo -e "${RED}${BOLD}ERROR: $1${NC}"; }
 
 # --- Configuration ---
-TMP_ARCHIVE="archive.tar"
-TMP_REMOTE_DIR="/tmp/chunk_transfer" # Temporary directory on the remote host
-CHUNK_PREFIX="archive.part."
-MAX_RETRIES=5 # Maximum number of times to retry missing chunks
-# ---------------------
+TMP_ARCHIVE="nimbus_bundle.tar.gz"
+TMP_REMOTE_DIR="/tmp/nimbus_transfer"
+CHUNK_PREFIX="nimbus_part."
+SUM_FILE="nimbus_manifest.sha256"
+SSH_SOCKET="/tmp/nimbus_ssh_%h_%p_%r.sock"
+MAX_RETRIES=5
 
+# --- Validation & Dependencies ---
 if [ "$#" -ne 4 ]; then
-  echo "Usage: $0 <source_path> <destination_path> <block_size_mb> <parallel_jobs>"
-  exit 1
+    echo -e "${YELLOW}Usage: $0 <source_path> <destination_path> <block_size_mb> <parallel_jobs>${NC}"
+    exit 1
 fi
 
-# --- Argument Parsing ---
+for cmd in pv parallel sha256sum bc; do
+    if ! command -v $cmd &> /dev/null; then
+        log_err "Missing local dependency: $cmd."
+        exit 1
+    fi
+done
+
 SOURCE_PATH="$1"
 DEST_PATH="$2"
 BLOCK_MB="$3"
 JOBS="$4"
-
-# Calculate block size in bytes
 BLOCK_SIZE=$((BLOCK_MB * 1024 * 1024))
+START_TIME=$(date +%s)
 
-# --- Remote Host Detection & Parsing (omitted for brevity, assume correct) ---
-REMOTE_PATTERN='^([^@]+)@([^:]+):(.+)$'
-IS_SOURCE_REMOTE=false
-IS_DEST_REMOTE=false
-SOURCE_REMOTE_TARGET=""
-DEST_REMOTE_TARGET=""
+# --- Remote Host Detection ---
+REMOTE_PATTERN="^([^@]+)@([^:]+):(.+)$"
+IS_SRC_REMOTE=false
+IS_DST_REMOTE=false
 
-# Check Source Path
 if [[ "$SOURCE_PATH" =~ $REMOTE_PATTERN ]]; then
-  IS_SOURCE_REMOTE=true
-  SOURCE_REMOTE_TARGET="${BASH_REMATCH[1]}@${BASH_REMATCH[2]}"
-  SOURCE_REMOTE_DIR="${BASH_REMATCH[3]}"
-  echo "Source is Remote: ${SOURCE_REMOTE_TARGET}"
+    IS_SRC_REMOTE=true
+    REMOTE_TARGET="${BASH_REMATCH[1]}@${BASH_REMATCH[2]}"
+    SRC_REMOTE_DIR="${BASH_REMATCH[3]}"
 fi
 
-# Check Destination Path
 if [[ "$DEST_PATH" =~ $REMOTE_PATTERN ]]; then
-  IS_DEST_REMOTE=true
-  DEST_REMOTE_TARGET="${BASH_REMATCH[1]}@${BASH_REMATCH[2]}"
-  DEST_REMOTE_DIR="${BASH_REMATCH[3]}"
-  echo "Destination is Remote: ${DEST_REMETE_TARGET}"
+    IS_DST_REMOTE=true
+    REMOTE_TARGET="${BASH_REMATCH[1]}@${BASH_REMATCH[2]}"
+    DST_REMOTE_DIR="${BASH_REMATCH[3]}"
 fi
 
-# --- Validate Scenarios (omitted for brevity) ---
-if $IS_SOURCE_REMOTE && $IS_DEST_REMOTE; then
-  echo "Error: Transfer between two remote hosts is not supported in this script."
-  exit 1
-fi
+# --- Helper Functions ---
 
-if $IS_SOURCE_REMOTE; then
-  REMOTE_TARGET="$SOURCE_REMOTE_TARGET"
-  REMOTE_PATH_TO_ARCHIVE="$SOURCE_REMOTE_DIR"
-  LOCAL_DEST="$DEST_PATH"
-  echo "--- Remote-to-Local Transfer Mode ---"
-elif $IS_DEST_REMOTE; then
-  REMOTE_TARGET="$DEST_REMOTE_TARGET"
-  REMOTE_DEST="$DEST_REMOTE_DIR"
-  LOCAL_SOURCE="$SOURCE_PATH"
-  echo "--- Local-to-Remote Transfer Mode ---"
-else
-  LOCAL_SOURCE="$SOURCE_PATH"
-  LOCAL_DEST="$DEST_PATH"
-  echo "--- Local-to-Local Transfer Mode ---"
-fi
-
-# --- Functions (omitted for brevity, assume correct) ---
-
-run_remote() {
-  if [ -n "$REMOTE_TARGET" ]; then
-    ssh -t "$REMOTE_TARGET" "$@"
-  else
-    exit 1
-  fi
+get_local_compressor() {
+    if command -v pigz >/dev/null 2>&1; then echo "pigz"; else echo "gzip"; fi
 }
 
-# Generic cleanup function to use on hard failure (omitted for brevity)
-final_cleanup() {
-  echo "--- Final Cleanup and Exit ---"
-  # Local cleanup
-  rm -f ./"$CHUNK_PREFIX"*
-  rm -f "$LOCAL_DEST"/"$CHUNK_PREFIX"*
-  # Remote cleanup (attempt best effort)
-  if [ -n "$REMOTE_TARGET" ]; then
-    run_remote "rm -rf ${TMP_REMOTE_DIR}"
-    run_remote "rm -f ${REMOTE_DEST}/${TMP_ARCHIVE}" 2>/dev/null
-  fi
-  exit 1
+setup_ssh_mux() {
+    if [ -n "$REMOTE_TARGET" ]; then
+        log_phase "SSH Handshake"
+        log_info "Opening Master Connection to $REMOTE_TARGET..."
+        ssh -M -S "$SSH_SOCKET" -fN -o ControlPersist=600 "$REMOTE_TARGET"
+        if [ $? -ne 0 ]; then
+            log_err "Failed to establish master connection."
+            exit 1
+        fi
+
+        if ssh -S "$SSH_SOCKET" "$REMOTE_TARGET" "command -v pigz" &>/dev/null; then
+            REMOTE_COMP="pigz"
+            log_info "Remote: Using pigz (Parallel)"
+        else
+            REMOTE_COMP="gzip"
+            log_info "Remote: Using gzip (Standard)"
+        fi
+    fi
 }
 
-# --- Core Logic ---
+close_ssh_mux() {
+    if [ -n "$REMOTE_TARGET" ]; then
+        ssh -S "$SSH_SOCKET" -O exit "$REMOTE_TARGET" 2>/dev/null
+    fi
+}
 
-if $IS_SOURCE_REMOTE; then
-  # ==================================
-  #         REMOTE-TO-LOCAL
-  # ==================================
+run_ssh() { ssh -S "$SSH_SOCKET" "$REMOTE_TARGET" "${@}"; }
+run_scp() { scp -o ControlPath="$SSH_SOCKET" "$@"; }
 
-  echo "1. Preparing remote host (${REMOTE_TARGET})..."
-  run_remote "mkdir -p ${TMP_REMOTE_DIR}"
+get_invalid_chunks() {
+    local dir="$1"
+    local manifest="$2"
+    (cd "$dir" && sha256sum -c "$manifest" --status 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        cd "$dir" && sha256sum -c "$manifest" 2>&1 | grep "FAILED\|ls: cannot access" | cut -d: -f1
+    fi
+}
 
-  echo "2. Creating and splitting archive on remote host..."
-  run_remote "tar -cvf ${TMP_REMOTE_DIR}/${TMP_ARCHIVE} -C $(dirname "$REMOTE_PATH_TO_ARCHIVE") $(basename "$REMOTE_PATH_TO_ARCHIVE")"
-  run_remote "split -b ${BLOCK_SIZE} -d -a 4 ${TMP_REMOTE_DIR}/${TMP_ARCHIVE} ${TMP_REMOTE_DIR}/${CHUNK_PREFIX}"
-  run_remote "rm -f ${TMP_REMOTE_DIR}/${TMP_ARCHIVE}"
+final_success_cleanup() {
+    log_phase "Finalizing"
 
-  # Get the list of all created chunks on the remote host
-  # CRITICAL FIX: Use 'tr -d "\r"' to remove carriage returns often introduced by SSH/terminal settings
-  REMOTE_CHUNKS_LIST_PATHS=$(run_remote "ls ${TMP_REMOTE_DIR}/${CHUNK_PREFIX}* 2>/dev/null" | tr -d '\r')
-  NUM_CHUNKS=$(echo "$REMOTE_CHUNKS_LIST_PATHS" | wc -l)
-  echo "Expected chunks: ${NUM_CHUNKS}"
-
-  if [ "$NUM_CHUNKS" -eq 0 ]; then
-    echo "Error: No chunks were created on remote host. Check source path."
-    final_cleanup
-  fi
-
-  echo "3. Transferring chunks to local destination (parallel=${JOBS})..."
-  mkdir -p "$LOCAL_DEST"
-
-  MISSING_CHUNKS="$REMOTE_CHUNKS_LIST_PATHS" # Start with all chunks
-  RETRY_COUNT=0
-
-  while [ -n "$MISSING_CHUNKS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "--- Transfer attempt #$RETRY_COUNT. Missing: $(echo "$MISSING_CHUNKS" | wc -l) ---"
-
-    # Transfer only the missing chunks, suppressing stdout
-    # FIX: Use -d '\n' with parallel to ensure it uses only newlines as delimiters, ignoring any left-over garbage
-    echo "$MISSING_CHUNKS" | parallel -j "$JOBS" -d '\n' "scp ${REMOTE_TARGET}:{} ${LOCAL_DEST}/ > /dev/null"
-
-    # --- INTEGRITY CHECK & FIND MISSING ---
-
-    # 1. Get the list of chunk *names* (not full paths) expected
-    # Fix: Use 'printf' to correctly pipe the list to xargs/basename
-    REMOTE_CHUNKS_NAMES=$(printf "%s" "$REMOTE_CHUNKS_LIST_PATHS" | xargs -n 1 basename | sort)
-
-    # 2. Get the list of chunk *names* currently transferred to local destination
-    LOCAL_CHUNKS_NAMES=$(ls "$LOCAL_DEST"/"$CHUNK_PREFIX"* 2>/dev/null | xargs -n 1 basename | sort)
-
-    ACTUAL_CHUNKS=$(echo "$LOCAL_CHUNKS_NAMES" | wc -l)
-
-    if [ "$ACTUAL_CHUNKS" -eq "$NUM_CHUNKS" ]; then
-      MISSING_CHUNKS="" # Transfer complete
-      break
+    if [ -f "$SUM_FILE" ]; then
+        total_blocks=$(wc -l < "$SUM_FILE")
+        total_mb=$((total_blocks * BLOCK_MB))
+    else
+        total_mb=0
     fi
 
-    # 3. Use 'comm' to find files present in the expected list but NOT in the local list (missing)
-    MISSING_NAMES=$(comm -23 <(echo "$REMOTE_CHUNKS_NAMES") <(echo "$LOCAL_CHUNKS_NAMES"))
+    rm -f ./"$CHUNK_PREFIX"* "$TMP_ARCHIVE" "$SUM_FILE" 2>/dev/null
 
-    # Reconstruct the full path list for the next scp attempt
-    MISSING_CHUNKS=""
-    for name in $MISSING_NAMES; do
-      # This variable construction is robust against newlines
-      MISSING_CHUNKS+="${TMP_REMOTE_DIR}/${name}\n"
+    if $IS_SRC_REMOTE || $IS_DST_REMOTE; then
+        run_ssh "rm -rf $TMP_REMOTE_DIR" 2>/dev/null
+    fi
+
+    close_ssh_mux
+
+    END_TIME=$(date +%s)
+    TOTAL_DURATION=$((END_TIME - START_TIME))
+    TRANSFER_DURATION=$((END_TIME - TRANSFER_START_TIME))
+    [ "$TRANSFER_DURATION" -le 0 ] && TRANSFER_DURATION=1
+
+    avg_speed=$(echo "scale=2; $total_mb / $TRANSFER_DURATION" | bc)
+
+    echo -e "\n${GREEN}${BOLD}Success!${NC}"
+    echo -e "Total Data:      ${YELLOW}${total_mb} MB${NC}"
+    echo -e "Transfer Time:   ${YELLOW}${TRANSFER_DURATION}s${NC}"
+    echo -e "Total Job Time:  ${YELLOW}${TOTAL_DURATION}s${NC}"
+    echo -e "Avg Speed:       ${YELLOW}${avg_speed} MB/s${NC}\n"
+}
+
+# --- Execution Logic ---
+
+LOCAL_COMP=$(get_local_compressor)
+setup_ssh_mux
+
+if $IS_SRC_REMOTE; then
+    log_phase "Mode: Remote -> Local"
+    RESUME_CHECK=$(run_ssh "[ -f $TMP_REMOTE_DIR/$SUM_FILE ] && echo 'exists' || echo 'missing'")
+    if [ "$RESUME_CHECK" == "exists" ]; then
+        log_info "Resuming from existing manifest..."
+    else
+        log_phase "Phase 1: Compression on Source"
+        REMOTE_SIZE=$(run_ssh "du -sb '$SRC_REMOTE_DIR' | cut -f1")
+        log_info "Remote processing..."
+        run_ssh "mkdir -p $TMP_REMOTE_DIR && \
+            tar -cf - -C \$(dirname '$SRC_REMOTE_DIR') \$(basename '$SRC_REMOTE_DIR') | $REMOTE_COMP | split -b $BLOCK_SIZE -d -a 4 - $TMP_REMOTE_DIR/$CHUNK_PREFIX && \
+            cd $TMP_REMOTE_DIR && sha256sum $CHUNK_PREFIX* > $SUM_FILE"
+    fi
+
+    log_phase "Phase 2: Syncing Manifest"
+    mkdir -p "$DEST_PATH"
+    run_scp "$REMOTE_TARGET:$TMP_REMOTE_DIR/$SUM_FILE" "$DEST_PATH/" >/dev/null
+
+    log_phase "Phase 3: Parallel Job (Transfer)"
+    RETRY=0
+    # FIX: Initialize start time once before the loop
+    TRANSFER_START_TIME=$(date +%s)
+    while [ $RETRY -lt $MAX_RETRIES ]; do
+        INVALID=$(get_invalid_chunks "$DEST_PATH" "$SUM_FILE")
+        [ -z "$INVALID" ] && break
+        ((RETRY++))
+        echo "$INVALID" | parallel -j "$JOBS" --bar "scp -o ControlPath=$SSH_SOCKET $REMOTE_TARGET:$TMP_REMOTE_DIR/{} $DEST_PATH/ >/dev/null 2>&1"
     done
 
-    MISSING_CHUNKS=$(echo -e "$MISSING_CHUNKS" | sed '/^$/d') # Clean up list
+    log_phase "Phase 4: Decompression on Destination"
+    TOTAL_SIZE=$(du -cb "$DEST_PATH"/"$CHUNK_PREFIX"* | tail -n1 | cut -f1)
+    cat "$DEST_PATH"/"$CHUNK_PREFIX"* | pv -s "$TOTAL_SIZE" --name "Decompressing" | $LOCAL_COMP -d | tar -xf - -C "$DEST_PATH"
+    final_success_cleanup
 
-    if [ -n "$MISSING_CHUNKS" ]; then
-      echo "Found $(echo "$MISSING_CHUNKS" | wc -l) chunks still missing. Retrying..."
-    fi
-  done
-
-  if [ -n "$MISSING_CHUNKS" ]; then
-    echo "ERROR: Failed to transfer all chunks after $MAX_RETRIES retries. Missing $(echo "$MISSING_CHUNKS" | wc -l) chunks."
-    final_cleanup
-  fi
-
-  echo "All $NUM_CHUNKS chunks successfully transferred."
-
-  # Final steps after successful transfer
-  echo "4. Reassembling archive locally in destination..."
-  cat "$LOCAL_DEST"/"$CHUNK_PREFIX"* >"$LOCAL_DEST"/"$TMP_ARCHIVE"
-
-  echo "5. Extracting archive locally..."
-  tar -xvf "$LOCAL_DEST/$TMP_ARCHIVE" -C "$LOCAL_DEST"
-
-  echo "6. Cleaning up..."
-  rm -f "$LOCAL_DEST"/"$CHUNK_PREFIX"*
-  rm -f "$LOCAL_DEST/$TMP_ARCHIVE"
-  run_remote "rm -rf ${TMP_REMOTE_DIR}"
-
-elif $IS_DEST_REMOTE; then
-  # ... (LOCAL-TO-REMOTE section remains the same, as local ls output is clean) ...
-
-  echo "1. Creating and splitting archive locally..."
-  tar -cvf "$TMP_ARCHIVE" -C "$(dirname "$LOCAL_SOURCE")" "$(basename "$LOCAL_SOURCE")"
-  split -b "$BLOCK_SIZE" -d -a 4 "$TMP_ARCHIVE" "$CHUNK_PREFIX"
-  rm -f "$TMP_ARCHIVE"
-
-  # List of local chunks (Source count)
-  LOCAL_CHUNKS_LIST_NAMES=$(ls "$CHUNK_PREFIX"* 2>/dev/null)
-  NUM_CHUNKS=$(echo "$LOCAL_CHUNKS_LIST_NAMES" | wc -l)
-  echo "Expected chunks: ${NUM_CHUNKS}"
-
-  echo "2. Preparing remote host (${REMOTE_TARGET})..."
-  run_remote "mkdir -p ${REMOTE_DEST}"
-  run_remote "mkdir -p ${TMP_REMOTE_DIR}" # Temporary folder on remote for chunks
-
-  echo "3. Transferring chunks to remote host (parallel=${JOBS})..."
-
-  MISSING_CHUNKS="$LOCAL_CHUNKS_LIST_NAMES" # Start with all chunks
-  RETRY_COUNT=0
-
-  while [ -n "$MISSING_CHUNKS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "--- Transfer attempt #$RETRY_COUNT. Missing: $(echo "$MISSING_CHUNKS" | wc -l) ---"
-
-    # Transfer only the missing chunks, suppressing stdout
-    echo "$MISSING_CHUNKS" | parallel -j "$JOBS" -d '\n' "scp {} ${REMOTE_TARGET}:${TMP_REMOTE_DIR}/ > /dev/null"
-
-    # --- INTEGRITY CHECK & FIND MISSING ---
-
-    # 1. Get the list of chunk names expected (Source list)
-    EXPECTED_NAMES=$(echo "$LOCAL_CHUNKS_LIST_NAMES" | sort)
-
-    # 2. Get the list of chunk names currently transferred to remote destination (Destination list)
-    # Clean remote ls output here too, just in case, though the transfer target is remote.
-    REMOTE_CHUNKS_NAMES=$(run_remote "ls ${TMP_REMOTE_DIR}/${CHUNK_PREFIX}* 2>/dev/null" | tr -d '\r' | xargs -n 1 basename | sort)
-
-    ACTUAL_CHUNKS=$(echo "$REMOTE_CHUNKS_NAMES" | wc -l)
-
-    if [ "$ACTUAL_CHUNKS" -eq "$NUM_CHUNKS" ]; then
-      MISSING_CHUNKS="" # Transfer complete
-      break
+elif $IS_DST_REMOTE; then
+    log_phase "Mode: Local -> Remote"
+    if [ -f "$SUM_FILE" ]; then
+        log_info "Resuming from existing manifest..."
+    else
+        log_phase "Phase 1: Compression on Source"
+        SRC_SIZE=$(du -sb "$SOURCE_PATH" | cut -f1)
+        tar -cf - -C "$(dirname "$SOURCE_PATH")" "$(basename "$SOURCE_PATH")" | \
+            pv -s "$SRC_SIZE" --name "Compressing" | \
+            $LOCAL_COMP | split -b "$BLOCK_SIZE" -d -a 4 - "$CHUNK_PREFIX"
+        sha256sum "$CHUNK_PREFIX"* > "$SUM_FILE"
     fi
 
-    # 3. Use 'comm' to find files present in the expected list but NOT in the remote list (missing)
-    MISSING_CHUNKS=$(comm -23 <(echo "$EXPECTED_NAMES") <(echo "$REMOTE_CHUNKS_NAMES"))
+    run_ssh "mkdir -p '$DST_REMOTE_DIR' '$TMP_REMOTE_DIR'"
+    run_scp "$SUM_FILE" "$REMOTE_TARGET:$TMP_REMOTE_DIR/" >/dev/null
 
-    MISSING_CHUNKS=$(echo -e "$MISSING_CHUNKS" | sed '/^$/d') # Clean up list
+    log_phase "Phase 2: Parallel Job (Transfer)"
+    RETRY=0
+    # FIX: Initialize start time once before the loop
+    TRANSFER_START_TIME=$(date +%s)
+    while [ $RETRY -lt $MAX_RETRIES ]; do
+        INVALID=$(run_ssh "cd $TMP_REMOTE_DIR && sha256sum -c $SUM_FILE 2>&1 | grep 'FAILED\|cannot access' | cut -d: -f1" | tr -d '\r')
+        [ -z "$INVALID" ] && break
+        ((RETRY++))
+        echo "$INVALID" | parallel -j "$JOBS" --bar "scp -o ControlPath=$SSH_SOCKET {} $REMOTE_TARGET:$TMP_REMOTE_DIR/ >/dev/null 2>&1"
+    done
 
-    if [ -n "$MISSING_CHUNKS" ]; then
-      echo "Found $(echo "$MISSING_CHUNKS" | wc -l) chunks still missing. Retrying..."
-    fi
-  done
-
-  if [ -n "$MISSING_CHUNKS" ]; then
-    echo "ERROR: Failed to transfer all chunks after $MAX_RETRIES retries. Missing $(echo "$MISSING_CHUNKS" | wc -l) chunks."
-    final_cleanup
-  fi
-
-  echo "All $NUM_CHUNKS chunks successfully transferred."
-
-  # Final steps after successful transfer
-  echo "4. Reassembling archive on remote host..."
-  run_remote "cat ${TMP_REMOTE_DIR}/${CHUNK_PREFIX}* > ${REMOTE_DEST}/${TMP_ARCHIVE}"
-
-  echo "5. Extracting archive on remote host..."
-  run_remote "tar -xvf ${REMOTE_DEST}/${TMP_ARCHIVE} -C ${REMOTE_DEST}"
-
-  echo "6. Cleaning up..."
-  rm -f ./"$CHUNK_PREFIX"*
-  run_remote "rm -rf ${TMP_REMOTE_DIR}"
-  run_remote "rm -f ${REMOTE_DEST}/${TMP_ARCHIVE}"
+    log_phase "Phase 3: Decompression on Destination"
+    log_info "Processing final files on remote server..."
+    run_ssh "cat $TMP_REMOTE_DIR/$CHUNK_PREFIX* | $REMOTE_COMP -d | tar -xf - -C $DST_REMOTE_DIR"
+    final_success_cleanup
 
 else
-  # ... (LOCAL-TO-LOCAL section remains the same) ...
+    log_phase "Mode: Local -> Local"
+    if [ ! -f "$SUM_FILE" ]; then
+        log_phase "Phase 1: Compression on Source"
+        SRC_SIZE=$(du -sb "$SOURCE_PATH" | cut -f1)
+        tar -cf - -C "$(dirname "$SOURCE_PATH")" "$(basename "$SOURCE_PATH")" | \
+            pv -s "$SRC_SIZE" --name "Compressing" | \
+            $LOCAL_COMP | split -b "$BLOCK_SIZE" -d -a 4 - "$CHUNK_PREFIX"
+        sha256sum "$CHUNK_PREFIX"* > "$SUM_FILE"
+        mkdir -p "$DEST_PATH"
+        cp "$SUM_FILE" "$DEST_PATH/"
+    fi
 
-  echo "1. Creating and splitting archive locally..."
-  tar -cvf "$TMP_ARCHIVE" -C "$(dirname "$LOCAL_SOURCE")" "$(basename "$LOCAL_SOURCE")"
-  split -b "$BLOCK_SIZE" -d -a 4 "$TMP_ARCHIVE" "$CHUNK_PREFIX"
-  rm -f "$TMP_ARCHIVE"
+    log_phase "Phase 2: Parallel Job (Moving)"
+    # FIX: Initialize start time once
+    TRANSFER_START_TIME=$(date +%s)
+    ls "$CHUNK_PREFIX"* | parallel -j "$JOBS" --bar cp -n {} "$DEST_PATH/"
 
-  LOCAL_CHUNKS_LIST=$(ls "$CHUNK_PREFIX"* 2>/dev/null)
-  NUM_CHUNKS=$(echo "$LOCAL_CHUNKS_LIST" | wc -l)
-  echo "Expected chunks: ${NUM_CHUNKS}"
-
-  echo "2. Transferring chunks to destination (parallel=${JOBS})..."
-  mkdir -p "$LOCAL_DEST"
-
-  # Use mv for local transfer
-  echo "$LOCAL_CHUNKS_LIST" | parallel -j "$JOBS" mv {} "$LOCAL_DEST/"
-
-  # --- INTEGRITY CHECK ---
-  ACTUAL_CHUNKS=$(ls "$LOCAL_DEST"/"$CHUNK_PREFIX"* 2>/dev/null | wc -l)
-  echo "Actual chunks transferred: ${ACTUAL_CHUNKS}"
-
-  if [ "$ACTUAL_CHUNKS" -ne "$NUM_CHUNKS" ]; then
-    echo "ERROR: Chunk count mismatch! Expected $NUM_CHUNKS, found $ACTUAL_CHUNKS."
-    final_cleanup
-  fi
-  # -----------------------
-
-  echo "3. Reassembling archive in destination..."
-  cat "$LOCAL_DEST"/"$CHUNK_PREFIX"* >"$LOCAL_DEST"/"$TMP_ARCHIVE"
-
-  echo "4. Extracting archive..."
-  tar -xvf "$LOCAL_DEST/$TMP_ARCHIVE" -C "$LOCAL_DEST"
-
-  echo "5. Cleaning up..."
-  rm -f "$LOCAL_DEST"/"$CHUNK_PREFIX"*
-  rm -f "$LOCAL_DEST/$TMP_ARCHIVE"
+    log_phase "Phase 3: Decompression on Destination"
+    TOTAL_SIZE=$(du -cb "$DEST_PATH"/"$CHUNK_PREFIX"* | tail -n1 | cut -f1)
+    cat "$DEST_PATH"/"$CHUNK_PREFIX"* | pv -s "$TOTAL_SIZE" --name "Decompressing" | $LOCAL_COMP -d | tar -xf - -C "$DEST_PATH"
+    final_success_cleanup
 fi
-
-echo "Done."
