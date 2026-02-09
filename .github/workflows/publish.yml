@@ -1,13 +1,12 @@
 name: Create Release
 
-# Trigger on git tag pushes
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write  # needed to create releases via actions
+  contents: write
 
 jobs:
   release:
@@ -15,26 +14,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout the repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Create the Release from the pushed tag
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ github.ref_name }}         # the tag you just pushed
-          release_name: Release ${{ github.ref_name }}
+          tag: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           body: |
             Release ${{ github.ref_name }} for Nimbus
             - Auto-generated release via GitHub Actions
+          artifacts: |
+            nimbus.sh
+          artifactContentType: application/x-sh
           draft: false
           prerelease: false
-
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./nimbus.sh   # or whatever file you generated
-          asset_name: nimbus
-          asset_content_type: application/x-sh
