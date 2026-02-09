@@ -2,10 +2,9 @@
   <img src="logo.png" width="400">
 </p>
 
-
 # nimbus
 
-parallel file transfer that uses `cp` and `rsync` to copy files from:
+parallel file transfer that uses `cp` and `scp` to copy files from:
 
 - local <-> local
 - remote <-> local
@@ -25,3 +24,11 @@ useful to transfer big file with poor internet connection or session limitations
 - statistics at the end of the transfer
 
 This script is aimed to transfer big files via an SSH connection that can be unstable or frequently dropped, a high number of blocks can help to resume the transfer from the last successful block instead of starting over again at the cost of some overhead (packet reconstruction, more hash calculations, etc)
+
+## Installation
+
+```bash
+sudo curl -fsSL \
+  https://raw.githubusercontent.com/filippo-ferrando/nimbus/$(curl -fsSL https://api.github.com/repos/filippo-ferrando/nimbus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)/nimbus.sh \
+  -o /usr/local/bin/nimbus && sudo chmod +x /usr/local/bin/nimbus
+```
