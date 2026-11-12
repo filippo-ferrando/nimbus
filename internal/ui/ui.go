@@ -110,15 +110,15 @@ type UI struct {
 	verbose bool
 	p       palette
 
-	mu       sync.Mutex
-	live     bool
-	lines    int
-	stats    *Stats
-	title    string
-	stop     chan struct{}
-	stopped  chan struct{}
-	samples  []sample
-	frame    int
+	mu        sync.Mutex
+	live      bool
+	lines     int
+	stats     *Stats
+	title     string
+	stop      chan struct{}
+	stopped   chan struct{}
+	samples   []sample
+	frame     int
 	lastPlain time.Time
 	startLive time.Time
 }
@@ -230,6 +230,7 @@ func (u *UI) StartLive(title string, s *Stats) {
 	u.live, u.stats, u.title = true, s, title
 	u.stop, u.stopped = make(chan struct{}), make(chan struct{})
 	u.startLive = time.Now()
+	u.lastPlain = u.startLive
 	u.samples = nil
 	u.mu.Unlock()
 	if u.rich {
@@ -445,7 +446,7 @@ func (u *UI) drawLive() {
 		lines = append(lines, u.taskLine(t, w))
 	}
 	for _, l := range lines {
-		fmt.Fprintln(u.out, l)
+		fmt.Fprintln(u.out, clamp(l, w-1, p.reset))
 	}
 	u.lines = len(lines)
 }
@@ -465,12 +466,42 @@ func (u *UI) taskLine(t *Task, w int) string {
 		}
 		prog = fmt.Sprintf("%9s/%-9s%-12s", Bytes(d), Bytes(t.Total), rate)
 	} else {
-		prog = fmt.Sprintf("%9s %s", Bytes(t.Total), strings.Repeat(" ", 21))
+		prog = fmt.Sprintf("%9s %-9s%-12s", Bytes(t.Total), "", Duration(time.Since(t.Start)))
 		mini = strings.Repeat(" ", 13)
 	}
 	head := fmt.Sprintf("  %s▸%s %s#%-4d%s %s%-7s%s %s", color, p.reset, p.dim, t.Seq, p.reset, color, t.Stage, p.reset, mini)
 	room := w - visible(head) - visible(prog) - 2
 	return head + prog + " " + p.dim + truncLeft(t.Label, room) + p.reset
+}
+
+// clamp cuts s to at most n visible characters, keeping ANSI escapes intact,
+// so live lines never wrap (which would break redrawing).
+func clamp(s string, n int, reset string) string {
+	if visible(s) <= n {
+		return s
+	}
+	var b strings.Builder
+	cnt, esc := 0, false
+	for _, r := range s {
+		switch {
+		case esc:
+			b.WriteRune(r)
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				esc = false
+			}
+		case r == 0x1b:
+			esc = true
+			b.WriteRune(r)
+		default:
+			if cnt >= n {
+				continue
+			}
+			b.WriteRune(r)
+			cnt++
+		}
+	}
+	b.WriteString(reset)
+	return b.String()
 }
 
 // visible returns the printed width of s, ignoring ANSI escapes.

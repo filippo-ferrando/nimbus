@@ -69,6 +69,7 @@ type Result struct {
 	Comp      string
 	Failed    int
 	Deleted   int
+	Blocked   int // entries that could not be applied (rsync exit 23)
 	DryRun    bool
 }
 
@@ -120,9 +121,22 @@ func (e *Engine) do(ctx context.Context, what string, eps []*Endpoint, fn func(c
 // ---------------------------------------------------------------- run
 
 // Run executes the transfer.
-func (e *Engine) Run(ctx context.Context) (*Result, error) {
-	res := &Result{Started: time.Now()}
+func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
+	res = &Result{Started: time.Now()}
 	u := e.UI
+	// Until data is staged, a failed or dry run leaves nothing worth keeping
+	// (unless an interrupted run left a plan and data behind).
+	_, statErr := os.Stat(filepath.Join(e.localStage(), "plan.json"))
+	staged := statErr == nil
+	defer func() {
+		if !staged && ctx.Err() == nil && (err != nil || res == nil || res.DryRun) {
+			for _, ep := range []*Endpoint{e.Src, e.Dst} {
+				if ep.Info != nil && (ep == e.Src || !e.Shared) {
+					_ = ep.call(context.Background(), "clean", nil, nil, nil)
+				}
+			}
+		}
+	}()
 
 	// 1. prepare endpoints
 	u.Phase("Preparing endpoints")
@@ -152,7 +166,7 @@ func (e *Engine) Run(ctx context.Context) (*Result, error) {
 	u.Phase("Scanning source and destination")
 	var srcList, dstList []Entry
 	var srcSkip, dstSkip []string
-	err := parallel([]int{0, 1}, func(i int) error {
+	err = parallel([]int{0, 1}, func(i int) error {
 		if i == 0 {
 			return e.do(ctx, "list source", []*Endpoint{e.Src}, func(ctx context.Context) error {
 				var err error
@@ -242,13 +256,21 @@ func (e *Engine) Run(ctx context.Context) (*Result, error) {
 	}
 	res.Batches = len(batches)
 
+	staged = true
+
 	// 4. staged state from a previous run
 	if err := e.loadState(ctx); err != nil {
 		return nil, err
 	}
 
 	// 5. prepare destination tree
-	if err := e.prepareDest(ctx, d, batches); err != nil {
+	partials := map[string]bool{}
+	for _, de := range dstList {
+		if de.Type == 'f' && isPart(de.Path) {
+			partials[de.Path] = true
+		}
+	}
+	if err := e.prepareDest(ctx, d, batches, partials); err != nil {
 		return nil, err
 	}
 
@@ -276,6 +298,7 @@ func (e *Engine) Run(ctx context.Context) (*Result, error) {
 		return res, err
 	}
 	res.Deleted = len(d.Delete)
+	res.Blocked = len(d.Blocked)
 	if !e.O.KeepStaging {
 		for _, ep := range eps {
 			if err := ep.call(ctx, "clean", nil, nil, nil); err != nil {
@@ -378,8 +401,8 @@ func (e *Engine) chooseComp() error {
 // ---------------------------------------------------------------- state
 
 type stageState struct {
-	packed   map[string][2]string // key -> sha, size
-	data     map[string]bool
+	packed    map[string][2]string // key -> sha, size
+	data      map[string]bool
 	extracted map[string]bool
 }
 
@@ -428,7 +451,7 @@ func (e *Engine) loadState(ctx context.Context) error {
 
 // ---------------------------------------------------------------- prepare
 
-func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch) error {
+func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch, partials map[string]bool) error {
 	dst := e.Dst
 	root := agent.Arg(dst.Root)
 	if len(d.Replace) > 0 {
@@ -451,6 +474,8 @@ func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch) err
 	for _, s := range d.Send {
 		byPath[s.Path] = s
 	}
+	// Part markers from a previous run only count while the partial file
+	// they were written into still exists.
 	started := map[string]bool{}
 	for _, b := range batches {
 		if b.Kind != "part" {
@@ -459,7 +484,11 @@ func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch) err
 		e.partsLeft[b.Path]++
 		e.partEntry[b.Path] = byPath[b.Path]
 		if e.dstState.extracted[b.Key] {
-			started[b.Path] = true
+			if partials[partName(b.Path)] {
+				started[b.Path] = true
+			} else {
+				delete(e.dstState.extracted, b.Key)
+			}
 		}
 	}
 	var stale []string

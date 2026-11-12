@@ -37,7 +37,7 @@ func ComputeDiff(src, dst []Entry, o DiffOptions) *Diff {
 		}
 		dmap[dst[i].Path] = &dst[i]
 	}
-	smap := make(map[string]bool, len(src))
+	smap := make(map[string]byte, len(src))
 	touched := map[string]bool{} // dirs whose contents change
 
 	markParent := func(p string) {
@@ -57,7 +57,7 @@ func ComputeDiff(src, dst []Entry, o DiffOptions) *Diff {
 	}
 
 	for _, s := range src {
-		smap[s.Path] = true
+		smap[s.Path] = s.Type
 		de := dmap[s.Path]
 		if de != nil && underRemoved(s.Path) {
 			de = nil
@@ -111,7 +111,7 @@ func ComputeDiff(src, dst []Entry, o DiffOptions) *Diff {
 
 	if o.Delete {
 		for _, e := range dst {
-			if isPart(e.Path) || smap[e.Path] {
+			if _, ok := smap[e.Path]; isPart(e.Path) || ok {
 				continue
 			}
 			// Only the top-most missing entry; rm -rf handles the rest.
@@ -151,11 +151,11 @@ func ComputeDiff(src, dst []Entry, o DiffOptions) *Diff {
 	return d
 }
 
-// topMost reports whether p's parent exists in the source (so p is the
-// highest destination-only entry on its branch).
-func topMost(p string, smap map[string]bool) bool {
+// topMost reports whether p's parent is a directory in the source (so p is
+// the highest destination-only entry on its branch).
+func topMost(p string, smap map[string]byte) bool {
 	dir, _ := splitPath(p)
-	return smap[dir]
+	return smap[dir] == 'd'
 }
 
 // ApplyChecksums moves checksum candidates into Send/MetaFiles/Unchanged.

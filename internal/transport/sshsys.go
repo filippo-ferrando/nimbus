@@ -29,11 +29,11 @@ type System struct {
 
 // SystemOptions controls the system ssh transport.
 type SystemOptions struct {
-	Conns int
-	ID    string // transfer id, used to name control sockets
-	Port  int
+	Conns    int
+	ID       string // transfer id, used to name control sockets
+	Port     int
 	Identity string
-	Logf  func(format string, args ...any)
+	Logf     func(format string, args ...any)
 }
 
 func socketDir() string {

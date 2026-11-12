@@ -64,9 +64,9 @@ func ExitCode(err error) int {
 
 type Local struct{}
 
-func (Local) Name() string                      { return "local" }
-func (Local) IsLocal() bool                     { return true }
-func (Local) Close() error                      { return nil }
+func (Local) Name() string                        { return "local" }
+func (Local) IsLocal() bool                       { return true }
+func (Local) Close() error                        { return nil }
 func (Local) Reconnect(ctx context.Context) error { return nil }
 
 func (Local) Run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.Writer) error {

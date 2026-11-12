@@ -24,9 +24,9 @@ import (
 
 // SSHTarget describes where to connect.
 type SSHTarget struct {
-	User string // may be empty: resolved from ssh config / current user
-	Host string // alias or hostname as written by the user
-	Port int    // 0: from ssh config or 22
+	User     string // may be empty: resolved from ssh config / current user
+	Host     string // alias or hostname as written by the user
+	Port     int    // 0: from ssh config or 22
 	Identity string
 }
 
@@ -41,15 +41,19 @@ type NativeOptions struct {
 // Native is a pool of independent SSH connections (separate TCP streams and
 // cipher states) authenticated once.
 type Native struct {
-	target   SSHTarget
-	addr     string
-	user     string
-	cfg      *ssh.ClientConfig
-	opts     NativeOptions
-	slots    []*slot
-	mu       sync.Mutex
-	closed   bool
-	label    string
+	target SSHTarget
+	addr   string
+	user   string
+	cfg    *ssh.ClientConfig
+	opts   NativeOptions
+	slots  []*slot
+	mu     sync.Mutex
+	closed bool
+	label  string
+
+	recMu     sync.Mutex
+	lastCheck time.Time
+	lastErr   error
 }
 
 type slot struct {
@@ -61,10 +65,10 @@ type slot struct {
 
 // authCache keeps secrets typed by the user so reconnects never prompt.
 type authCache struct {
-	mu        sync.Mutex
-	password  string
-	havePass  bool
-	tty       *os.File
+	mu          sync.Mutex
+	password    string
+	havePass    bool
+	tty         *os.File
 	interactive bool
 }
 
@@ -143,7 +147,7 @@ func NewNative(ctx context.Context, t SSHTarget, opts NativeOptions) (*Native, e
 		opts.DialTimeout = 20 * time.Second
 	}
 	if opts.Keepalive == 0 {
-		opts.Keepalive = 15 * time.Second
+		opts.Keepalive = 10 * time.Second
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
@@ -480,7 +484,7 @@ func (n *Native) keepalive(s *slot, c *ssh.Client) {
 					c.Close()
 					return
 				}
-			case <-time.After(3 * n.opts.Keepalive):
+			case <-time.After(2 * n.opts.Keepalive):
 				n.markDead(s, c)
 				c.Close()
 				return
@@ -515,30 +519,65 @@ func (n *Native) pick() *slot {
 func (n *Native) Name() string  { return n.label }
 func (n *Native) IsLocal() bool { return false }
 
-// Reconnect re-establishes every dead slot using cached credentials.
+// Reconnect probes every connection (dropping unresponsive ones) and
+// re-establishes dead slots using cached credentials. Concurrent callers share
+// one check.
 func (n *Native) Reconnect(ctx context.Context) error {
+	n.recMu.Lock()
+	defer n.recMu.Unlock()
+	if time.Since(n.lastCheck) < time.Second && n.lastErr == nil {
+		return nil
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	var firstErr error
 	alive := 0
 	for _, s := range n.slots {
-		s.mu.Lock()
-		dead := s.dead || s.client == nil
-		s.mu.Unlock()
-		if !dead {
-			alive++
-			continue
-		}
-		if err := n.connect(ctx, s); err != nil {
-			if firstErr == nil {
-				firstErr = err
+		wg.Add(1)
+		go func(s *slot) {
+			defer wg.Done()
+			s.mu.Lock()
+			c, dead := s.client, s.dead || s.client == nil
+			s.mu.Unlock()
+			if !dead && !ping(c, 3*time.Second) {
+				n.markDead(s, c)
+				c.Close()
+				dead = true
 			}
-			continue
-		}
-		alive++
+			var err error
+			if dead {
+				err = n.connect(ctx, s)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+			alive++
+		}(s)
 	}
+	wg.Wait()
+	n.lastCheck = time.Now()
+	n.lastErr = nil
 	if alive == 0 {
-		return fmt.Errorf("%w: %v", ErrConn, firstErr)
+		n.lastErr = fmt.Errorf("%w: %v", ErrConn, firstErr)
+		return n.lastErr
 	}
 	return nil
+}
+
+func ping(c *ssh.Client, timeout time.Duration) bool {
+	res := make(chan error, 1)
+	go func() { _, _, err := c.SendRequest("keepalive@openssh.com", true, nil); res <- err }()
+	select {
+	case err := <-res:
+		return err == nil
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (n *Native) Run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -552,10 +591,32 @@ func (n *Native) Run(ctx context.Context, argv []string, stdin io.Reader, stdout
 	s.mu.Unlock()
 	defer func() { s.mu.Lock(); s.active--; s.mu.Unlock() }()
 
-	sess, err := client.NewSession()
-	if err != nil {
+	// NewSession blocks forever on a frozen connection: bound it.
+	type sr struct {
+		s   *ssh.Session
+		err error
+	}
+	sc := make(chan sr, 1)
+	go func() { s, err := client.NewSession(); sc <- sr{s, err} }()
+	var sess *ssh.Session
+	select {
+	case r := <-sc:
+		if r.err != nil {
+			n.markDead(s, client)
+			return fmt.Errorf("%w: %v", ErrConn, r.err)
+		}
+		sess = r.s
+	case <-time.After(n.opts.DialTimeout):
 		n.markDead(s, client)
-		return fmt.Errorf("%w: %v", ErrConn, err)
+		client.Close()
+		return fmt.Errorf("%w: timed out opening ssh session", ErrConn)
+	case <-ctx.Done():
+		go func() {
+			if r := <-sc; r.s != nil {
+				r.s.Close()
+			}
+		}()
+		return ctx.Err()
 	}
 	defer sess.Close()
 	sess.Stdin = stdin
@@ -565,11 +626,20 @@ func (n *Native) Run(ctx context.Context, argv []string, stdin io.Reader, stdout
 
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(ShellJoin(argv)) }()
+	var err error
 	select {
 	case <-ctx.Done():
 		_ = sess.Signal(ssh.SIGKILL)
 		sess.Close()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			// The connection is not responding: drop it so retries use a
+			// fresh one.
+			n.markDead(s, client)
+			client.Close()
+			<-done
+		}
 		return ctx.Err()
 	case err = <-done:
 	}
@@ -581,6 +651,10 @@ func (n *Native) Run(ctx context.Context, argv []string, stdin io.Reader, stdout
 		return &ExitError{Code: ee.ExitStatus(), Stderr: eb.String()}
 	}
 	n.markDead(s, client)
+	var em *ssh.ExitMissingError
+	if errors.As(err, &em) || errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: connection lost", ErrConn)
+	}
 	return fmt.Errorf("%w: %v", ErrConn, err)
 }
 
