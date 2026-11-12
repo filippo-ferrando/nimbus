@@ -234,3 +234,51 @@ func TestAgentArgRoundTrip(t *testing.T) {
 	}
 	_ = strings.TrimSpace
 }
+
+func TestFilter(t *testing.T) {
+	f, err := NewFilter([]string{"*.tmp", "cache/", "/top.txt", "a/b", "logs/**/x?.log", "[!k]eep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		rel  string
+		dir  bool
+		want bool
+	}{
+		{"x.tmp", false, true},
+		{"deep/er/x.tmp", false, true},
+		{"x.tmpl", false, false},
+		{"cache", true, true},
+		{"sub/cache", true, true},
+		{"cache", false, false}, // dir-only
+		{"top.txt", false, true},
+		{"sub/top.txt", false, false}, // anchored
+		{"a/b", false, true},
+		{"z/a/b", false, true},
+		{"za/b", false, false},
+		{"logs/1/2/x1.log", false, true},
+		{"logs/x1.log", false, false},
+		{"seep", false, true},
+		{"keep", false, false},
+	}
+	for _, c := range cases {
+		if got := f.Excluded(c.rel, c.dir); got != c.want {
+			t.Errorf("%s (dir=%v): got %v", c.rel, c.dir, got)
+		}
+	}
+	es := []Entry{
+		{Path: "src", Type: 'd'},
+		{Path: "src/cache", Type: 'd'},
+		{Path: "src/cache/data", Type: 'f'},
+		{Path: "src/keep", Type: 'f'},
+		{Path: "src/top.txt", Type: 'f'},
+	}
+	got := f.Apply(es, "src")
+	var paths []string
+	for _, e := range got {
+		paths = append(paths, e.Path)
+	}
+	if !reflect.DeepEqual(paths, []string{"src", "src/keep"}) {
+		t.Errorf("apply = %v", paths)
+	}
+}

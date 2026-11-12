@@ -91,31 +91,47 @@ func (a *authCache) getPassword(prompt string) (string, error) {
 	return a.password, nil
 }
 
-// customCfg is loaded from $NIMBUS_SSH_CONFIG when set (used by tests and
-// for users who keep their ssh config elsewhere).
-var customCfg = func() *sshconfig.Config {
-	p := os.Getenv("NIMBUS_SSH_CONFIG")
-	if p == "" {
-		return nil
-	}
-	f, err := os.Open(p)
+// customCfg replaces ~/.ssh/config when set with SetConfigFile (-F) or
+// $NIMBUS_SSH_CONFIG.
+var customCfg *sshconfig.Config
+
+// SetConfigFile makes the native client read path instead of ~/.ssh/config.
+func SetConfigFile(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer f.Close()
 	c, err := sshconfig.Decode(f)
 	if err != nil {
-		return nil
+		return fmt.Errorf("ssh config %s: %w", path, err)
 	}
-	return c
-}()
+	customCfg = c
+	return nil
+}
+
+// NeedsSystemSSH reports why the native client cannot reach alias (proxy
+// settings it does not implement), or "" when it can.
+func NeedsSystemSSH(alias string) string {
+	for _, k := range []string{"ProxyJump", "ProxyCommand"} {
+		if v := cfgGet(alias, k); v != "" && !strings.EqualFold(v, "none") {
+			return k
+		}
+	}
+	return ""
+}
+
+var cfgErr error
 
 func cfgGet(alias, key string) string {
 	if customCfg != nil {
 		v, _ := customCfg.Get(alias, key)
 		return v
 	}
-	v, _ := sshconfig.GetStrict(alias, key)
+	v, err := sshconfig.GetStrict(alias, key)
+	if err != nil && cfgErr == nil {
+		cfgErr = err
+	}
 	return v
 }
 
@@ -160,6 +176,9 @@ func NewNative(ctx context.Context, t SSHTarget, opts NativeOptions) (*Native, e
 		return nil, fmt.Errorf("host %q uses ProxyCommand in ssh config, which the native client does not support; use --ssh-cmd ssh", alias)
 	}
 	hostname := cfgGet(alias, "HostName")
+	if cfgErr != nil {
+		opts.Logf("cannot parse ssh config (%v): using defaults; --ssh-cmd ssh uses your ssh binary instead", cfgErr)
+	}
 	if hostname == "" {
 		hostname = alias
 	}
@@ -355,14 +374,15 @@ func hostKeyCallback(alias, hostname string, port int) (ssh.HostKeyCallback, []s
 	if err != nil {
 		return nil, nil, fmt.Errorf("known_hosts: %w", err)
 	}
-	keyAlias := hostname
-	if alias != hostname {
-		// ssh uses HostKeyAlias or the HostName for lookups.
-		if a := cfgGet(alias, "HostKeyAlias"); a != "" {
-			keyAlias = a
+	// Like OpenSSH: HostKeyAlias replaces host and port in the lookup.
+	lookup := net.JoinHostPort(hostname, strconv.Itoa(port))
+	if a := cfgGet(alias, "HostKeyAlias"); a != "" {
+		if _, _, err := net.SplitHostPort(a); err == nil {
+			lookup = a
+		} else {
+			lookup = net.JoinHostPort(a, "22")
 		}
 	}
-	lookup := net.JoinHostPort(keyAlias, strconv.Itoa(port))
 
 	var algos []string
 	if pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl")); err == nil {
@@ -374,6 +394,11 @@ func hostKeyCallback(alias, hostname string, port int) (ssh.HostKeyCallback, []s
 		}
 	}
 	algos = dedup(algos)
+	if len(algos) == 0 {
+		// Unknown host: prefer modern key types like OpenSSH does.
+		algos = []string{ssh.KeyAlgoED25519, ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521,
+			ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}
+	}
 
 	var mu sync.Mutex
 	cb := func(_ string, remote net.Addr, key ssh.PublicKey) error {
@@ -525,7 +550,7 @@ func (n *Native) IsLocal() bool { return false }
 func (n *Native) Reconnect(ctx context.Context) error {
 	n.recMu.Lock()
 	defer n.recMu.Unlock()
-	if time.Since(n.lastCheck) < time.Second && n.lastErr == nil {
+	if time.Since(n.lastCheck) < time.Second && n.lastErr == nil && n.pick() != nil && n.allAlive() {
 		return nil
 	}
 	var wg sync.WaitGroup
@@ -567,6 +592,18 @@ func (n *Native) Reconnect(ctx context.Context) error {
 		return n.lastErr
 	}
 	return nil
+}
+
+func (n *Native) allAlive() bool {
+	for _, s := range n.slots {
+		s.mu.Lock()
+		dead := s.dead || s.client == nil
+		s.mu.Unlock()
+		if dead {
+			return false
+		}
+	}
+	return true
 }
 
 func ping(c *ssh.Client, timeout time.Duration) bool {

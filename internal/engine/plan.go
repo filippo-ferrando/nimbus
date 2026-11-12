@@ -53,6 +53,9 @@ type PlanOptions struct {
 	Comp     string
 	Level    int
 	Previous []*Batch // plan from an interrupted run, reused when still valid
+	// ForcePart sends every file as raw byte ranges (used when the file is
+	// renamed on the destination, which tar cannot do portably).
+	ForcePart bool
 }
 
 // MakePlan groups entries into batches. Files larger than Block are split
@@ -107,7 +110,7 @@ func MakePlan(send []Entry, o PlanOptions) []*Batch {
 		if used[e.Path] {
 			continue
 		}
-		if e.Type == 'f' && e.Size > o.Block {
+		if e.Type == 'f' && (e.Size > o.Block || o.ForcePart) {
 			out = append(out, partBatches(e, o.Block, tag)...)
 			continue
 		}
@@ -142,6 +145,9 @@ func tarBatch(es []Entry, tag string) *Batch {
 func partBatches(e Entry, block int64, tag string) []*Batch {
 	const mib = 1 << 20
 	n := int((e.Size + block - 1) / block)
+	if n == 0 {
+		n = 1 // empty file: one empty part creates it
+	}
 	per := block / mib
 	var out []*Batch
 	for i := 0; i < n; i++ {
@@ -150,7 +156,7 @@ func partBatches(e Entry, block int64, tag string) []*Batch {
 		entryKey(h, e)
 		raw := block
 		if rem := e.Size - int64(i)*block; rem < raw {
-			raw = rem
+			raw = max(rem, 0)
 		}
 		out = append(out, &Batch{
 			Key: "p" + sumKey(h), Kind: "part", Path: e.Path, Index: i, Parts: n,

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,6 +38,11 @@ type Options struct {
 	Stall       time.Duration
 	KeepStaging bool
 	Fresh       bool
+	Exclude     *Filter
+	// RenameTarget is the destination path as given (without trailing
+	// slash). When the source is a single regular file and this path is not an
+	// existing directory, the file is written under this name (rsync rule).
+	RenameTarget string
 }
 
 // Engine runs one transfer.
@@ -55,6 +61,7 @@ type Engine struct {
 	partEntry map[string]Entry
 
 	srcState, dstState *stageState
+	renameFrom         string // rename mode: source entry name
 	errMu              sync.Mutex
 	failures           []string
 }
@@ -109,8 +116,10 @@ func (e *Engine) do(ctx context.Context, what string, eps []*Endpoint, fn func(c
 			}
 		}
 		err := fn(ctx)
-		switch transport.ExitCode(err) {
-		case 6:
+		// Only transport problems, stalls and checksum mismatches are worth
+		// retrying; anything else (permission denied, disk full, missing
+		// tools...) aborts immediately.
+		if err != nil && ctx.Err() == nil && !transport.IsConnErr(err) && transport.ExitCode(err) != 3 && !errors.Is(err, errChecksum) {
 			err = retry.Permanent(err)
 		}
 		last = err
@@ -152,6 +161,13 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	if e.Shared {
 		e.Dst.Info = e.Src.Info
 	}
+	if e.O.Fresh {
+		for _, ep := range eps {
+			if err := ep.call(ctx, "reset", nil, nil, nil); err != nil {
+				return nil, fmt.Errorf("%s: reset staging: %w", ep.Name(), err)
+			}
+		}
+	}
 	for _, ep := range eps {
 		u.Debug("%s: %s/%s tar=%s gfind=%s stat=%s sha=%q zstd=%s pigz=%s cpus=%s",
 			ep.Name(), ep.Info["os"], ep.Info["arch"], ep.Info["tar"], ep.Info["gfind"], ep.Info["stat"],
@@ -161,6 +177,10 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 		return nil, err
 	}
 	res.Comp = e.comp
+
+	if err := e.detectRename(ctx); err != nil {
+		return nil, err
+	}
 
 	// 2. list
 	u.Phase("Scanning source and destination")
@@ -192,6 +212,16 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	for _, s := range srcSkip {
 		u.Warn("skipping special file %s", s)
 	}
+	if e.renameFrom != "" {
+		for i := range srcList {
+			if srcList[i].Path == e.renameFrom {
+				srcList[i].Path = e.Dst.Sub
+			}
+		}
+	} else if !e.O.Exclude.Empty() {
+		srcList = e.O.Exclude.Apply(srcList, e.Src.Sub)
+		dstList = e.O.Exclude.Apply(dstList, e.Dst.Sub)
+	}
 	_ = dstSkip
 	if !e.Src.T.IsLocal() || e.Src.Info["tarnull"] != "1" || e.Dst.Info["tarnull"] != "1" {
 		for _, s := range srcList {
@@ -205,14 +235,16 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	if len(d.CheckSum) > 0 {
 		u.Phase("Comparing checksums of %s files", ui.Count(int64(len(d.CheckSum))))
 		paths := make([]string, len(d.CheckSum))
+		srcPaths := make([]string, len(d.CheckSum))
 		for i, s := range d.CheckSum {
 			paths[i] = s.Path
+			srcPaths[i] = e.srcPath(s.Path)
 		}
 		var ss, ds []string
 		err := parallel([]int{0, 1}, func(i int) error {
 			if i == 0 {
 				return e.do(ctx, "hash source", []*Endpoint{e.Src}, func(ctx context.Context) (err error) {
-					ss, err = e.Src.Hash(ctx, paths)
+					ss, err = e.Src.Hash(ctx, srcPaths)
 					return
 				})
 			}
@@ -250,7 +282,7 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	if !e.O.Fresh {
 		prev = LoadPlan(planPath)
 	}
-	batches := MakePlan(d.Send, PlanOptions{Block: e.O.Block, Comp: e.comp, Level: e.level, Previous: prev})
+	batches := MakePlan(d.Send, PlanOptions{Block: e.O.Block, Comp: e.comp, Level: e.level, Previous: prev, ForcePart: e.renameFrom != ""})
 	if err := SavePlan(planPath, batches); err != nil {
 		u.Warn("cannot save plan for resume: %v", err)
 	}
@@ -289,7 +321,7 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 		for _, f := range e.failures {
 			u.Error("%s", f)
 		}
-		return res, fmt.Errorf("%d of %d batches failed; staged data kept, run the same command again to resume", res.Failed, len(batches))
+		return res, fmt.Errorf("transfer aborted: %s; staged data kept, run the same command again to resume", e.failures[0])
 	}
 
 	// 7. metadata, deletions, cleanup
@@ -330,7 +362,7 @@ func printDryRun(d *Diff) {
 		fmt.Fprintf(w, "replace  %s\n", p)
 	}
 	for _, p := range d.MkDirs {
-		fmt.Fprintf(w, "mkdir    %s/\n", p)
+		fmt.Fprintf(w, "mkdir    %s/\n", rel(p))
 	}
 	for _, s := range d.Send {
 		if s.Type == 'l' {
@@ -345,6 +377,54 @@ func printDryRun(d *Diff) {
 	for _, p := range d.Delete {
 		fmt.Fprintf(w, "delete   %s\n", p)
 	}
+}
+
+// srcPath maps a destination-relative entry path to the source path.
+func (e *Engine) srcPath(p string) string {
+	if e.renameFrom != "" && p == e.Dst.Sub {
+		return e.renameFrom
+	}
+	return p
+}
+
+// detectRename applies rsync's rule for a single file: "nimbus file
+// host:dir/newname" writes newname unless it is an existing directory.
+func (e *Engine) detectRename(ctx context.Context) error {
+	t := e.O.RenameTarget
+	if t == "" || e.Src.Sub == "" {
+		return nil
+	}
+	var sk, dk byte
+	if err := e.do(ctx, "inspect source", []*Endpoint{e.Src}, func(ctx context.Context) (err error) {
+		sk, err = e.Src.Kind(ctx, e.Src.Root, e.Src.Sub)
+		return
+	}); err != nil {
+		return err
+	}
+	if sk != 'f' {
+		return nil
+	}
+	dir, base := path.Dir(t), path.Base(t)
+	if err := e.do(ctx, "inspect destination", []*Endpoint{e.Dst}, func(ctx context.Context) (err error) {
+		dk, err = e.Dst.Kind(ctx, dir, base)
+		return
+	}); err != nil {
+		return err
+	}
+	if dk == 'd' {
+		return nil
+	}
+	if dk == 'l' {
+		// rsync follows a symlink to a directory here; keep it simple and
+		// treat any existing symlink as the directory case only if it is one.
+		if k, err := e.Dst.Kind(ctx, t+"/.", ""); err == nil && k == 'd' {
+			return nil
+		}
+	}
+	e.renameFrom = e.Src.Sub
+	e.Dst.Root, e.Dst.Sub = dir, base
+	e.UI.Debug("single file: writing %s as %s", e.Src.Sub, t)
+	return nil
 }
 
 func (e *Engine) localStage() string {
@@ -477,6 +557,7 @@ func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch, par
 	// Part markers from a previous run only count while the partial file
 	// they were written into still exists.
 	started := map[string]bool{}
+	var invalid []string
 	for _, b := range batches {
 		if b.Kind != "part" {
 			continue
@@ -488,7 +569,15 @@ func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch, par
 				started[b.Path] = true
 			} else {
 				delete(e.dstState.extracted, b.Key)
+				invalid = append(invalid, b.Key)
 			}
+		}
+	}
+	if len(invalid) > 0 {
+		if err := e.do(ctx, "reset part markers", []*Endpoint{dst}, func(ctx context.Context) error {
+			return dst.call(ctx, "unmark", nil, strings.NewReader(strings.Join(invalid, "\n")+"\n"), nil)
+		}); err != nil {
+			return err
 		}
 	}
 	var stale []string
@@ -509,7 +598,9 @@ func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch, par
 
 // ---------------------------------------------------------------- pipeline
 
-func (e *Engine) pipeline(ctx context.Context, batches []*Batch) {
+func (e *Engine) pipeline(parent context.Context, batches []*Batch) {
+	ctx, abort := context.WithCancel(parent)
+	defer abort()
 	jobs := e.O.Jobs
 	window := make(chan struct{}, 2*jobs+2)
 	packSem := make(chan struct{}, jobs)
@@ -542,11 +633,12 @@ func (e *Engine) pipeline(ctx context.Context, batches []*Batch) {
 			defer wg.Done()
 			defer func() { <-window }()
 			if err := e.runBatch(ctx, b, packSem, xferSem, extSem); err != nil && ctx.Err() == nil {
+				// Abort the whole run on the first failure.
 				e.Stats.Failed.Add(1)
 				e.errMu.Lock()
 				e.failures = append(e.failures, fmt.Sprintf("batch #%d %s: %v", b.Seq, b.Label(), shortErr(err)))
 				e.errMu.Unlock()
-				e.UI.Error("batch #%d %s failed: %v", b.Seq, b.Label(), shortErr(err))
+				abort()
 			}
 		}(b)
 	}
@@ -564,7 +656,7 @@ func acquire(ctx context.Context, sem chan struct{}) error {
 }
 
 func (e *Engine) runBatch(ctx context.Context, b *Batch, packSem, xferSem, extSem chan struct{}) error {
-	src, dst := e.Src, e.Dst
+	src := e.Src
 	tag := fmt.Sprintf("batch #%d", b.Seq)
 
 	if b.Kind == "part" && e.dstState.extracted[b.Key] {
@@ -576,54 +668,29 @@ func (e *Engine) runBatch(ctx context.Context, b *Batch, packSem, xferSem, extSe
 		return e.partDone(ctx, b)
 	}
 
-	received := !e.Shared && e.dstState.data[b.Key]
-	if !received {
-		for attempt := 0; ; attempt++ {
-			sha, size, err := e.pack(ctx, b, packSem, tag)
-			if err != nil {
-				return err
-			}
-			if e.Shared {
-				break
-			}
-			err = e.send(ctx, b, sha, size, xferSem, tag)
-			if errors.Is(err, errSrcMissing) && attempt == 0 {
-				_ = src.call(ctx, "drop", []string{b.Key}, nil, nil)
-				e.partMu.Lock()
-				delete(e.srcState.packed, b.Key)
-				e.partMu.Unlock()
-				e.Stats.Packed.Add(-1)
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			break
+	for round := 0; ; round++ {
+		received := round == 0 && !e.Shared && e.dstState.data[b.Key]
+		if err := e.stageOnDest(ctx, b, received, packSem, xferSem, tag); err != nil {
+			return err
 		}
-	} else {
-		e.Stats.Packed.Add(1)
-	}
-	e.Stats.Sent.Add(1)
-	if e.Shared || received {
-		e.Stats.RawSent.Add(b.RawSize)
-	}
+		e.Stats.Sent.Add(1)
+		if e.Shared || received {
+			e.Stats.RawSent.Add(b.RawSize)
+		}
 
-	// extract
-	if err := acquire(ctx, extSem); err != nil {
-		return err
-	}
-	t := e.Stats.Begin(b.Seq, "extract", b.Label(), b.RawSize)
-	args := []string{b.Key, b.Kind, e.comp, agent.Arg(dst.Root)}
-	if b.Kind == "part" {
-		args = append(args, agent.Arg(rel(partName(b.Path))), strconv.FormatInt(b.Offset, 10))
-	}
-	err := e.do(ctx, tag+" extract", []*Endpoint{dst}, func(ctx context.Context) error {
-		return dst.call(ctx, "extract", args, nil, nil)
-	})
-	e.Stats.End(t)
-	<-extSem
-	if err != nil {
-		return err
+		err := e.extract(ctx, b, extSem, tag)
+		if errors.Is(err, errDstMissing) && round == 0 {
+			// Staged data vanished on the destination (e.g. cleaned by
+			// hand): send it again once.
+			e.Stats.Sent.Add(-1)
+			e.Stats.Packed.Add(-1)
+			e.Stats.RawSent.Add(-b.RawSize)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		break
 	}
 	if !e.Shared {
 		if err := e.do(ctx, tag+" cleanup", []*Endpoint{src}, func(ctx context.Context) error {
@@ -639,6 +706,58 @@ func (e *Engine) runBatch(ctx context.Context, b *Batch, packSem, xferSem, extSe
 		return e.partDone(ctx, b)
 	}
 	return nil
+}
+
+// stageOnDest makes sure the batch data is verified in destination staging.
+func (e *Engine) stageOnDest(ctx context.Context, b *Batch, received bool, packSem, xferSem chan struct{}, tag string) error {
+	if received {
+		e.Stats.Packed.Add(1)
+		return nil
+	}
+	for attempt := 0; ; attempt++ {
+		sha, size, err := e.pack(ctx, b, packSem, tag)
+		if err != nil {
+			return err
+		}
+		if e.Shared {
+			return nil
+		}
+		err = e.send(ctx, b, sha, size, xferSem, tag)
+		if errors.Is(err, errSrcMissing) && attempt == 0 {
+			_ = e.Src.call(ctx, "drop", []string{b.Key}, nil, nil)
+			e.partMu.Lock()
+			delete(e.srcState.packed, b.Key)
+			e.partMu.Unlock()
+			e.Stats.Packed.Add(-1)
+			continue
+		}
+		return err
+	}
+}
+
+var (
+	errDstMissing = errors.New("staged data missing on destination")
+	errChecksum   = errors.New("destination: checksum mismatch")
+)
+
+func (e *Engine) extract(ctx context.Context, b *Batch, sem chan struct{}, tag string) error {
+	if err := acquire(ctx, sem); err != nil {
+		return err
+	}
+	defer func() { <-sem }()
+	t := e.Stats.Begin(b.Seq, "extract", b.Label(), b.RawSize)
+	defer e.Stats.End(t)
+	args := []string{b.Key, b.Kind, e.comp, agent.Arg(e.Dst.Root)}
+	if b.Kind == "part" {
+		args = append(args, agent.Arg(rel(partName(b.Path))), strconv.FormatInt(b.Offset, 10))
+	}
+	return e.do(ctx, tag+" extract", []*Endpoint{e.Dst}, func(ctx context.Context) error {
+		err := e.Dst.call(ctx, "extract", args, nil, nil)
+		if transport.ExitCode(err) == 4 {
+			return retry.Permanent(errDstMissing)
+		}
+		return err
+	})
 }
 
 func (e *Engine) pack(ctx context.Context, b *Batch, sem chan struct{}, tag string) (sha string, size int64, err error) {
@@ -662,7 +781,7 @@ func (e *Engine) pack(ctx context.Context, b *Batch, sem chan struct{}, tag stri
 	if b.Kind == "tar" {
 		list = nulList(b.Paths).(*bytes.Buffer).Bytes()
 	} else {
-		list = []byte(rel(b.Path))
+		list = []byte(rel(e.srcPath(b.Path)))
 		args = append(args, strconv.FormatInt(b.Offset, 10), strconv.FormatInt(b.Count, 10))
 	}
 	err = e.do(ctx, tag+" pack", []*Endpoint{e.Src}, func(ctx context.Context) error {
@@ -803,7 +922,7 @@ func (e *Engine) send(ctx context.Context, b *Batch, sha string, size int64, sem
 		}
 		if recvErr != nil && !errors.Is(recvErr, context.Canceled) {
 			if transport.ExitCode(recvErr) == 3 {
-				return fmt.Errorf("destination: checksum mismatch")
+				return errChecksum
 			}
 			return fmt.Errorf("destination: %w", recvErr)
 		}

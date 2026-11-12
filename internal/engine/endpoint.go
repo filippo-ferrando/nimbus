@@ -122,6 +122,35 @@ func (ep *Endpoint) List(ctx context.Context) ([]Entry, []string, error) {
 	return ParseListing(out)
 }
 
+// Kind returns the type of root/sub: 'd', 'f', 'l', 'o' or 0 when missing.
+func (ep *Endpoint) Kind(ctx context.Context, root, sub string) (byte, error) {
+	if ep.T.IsLocal() {
+		fi, err := os.Lstat(filepath.Join(ExpandTilde(root), sub))
+		switch {
+		case err != nil && errors.Is(err, os.ErrNotExist):
+			return 0, nil
+		case err != nil:
+			return 0, err
+		case fi.Mode()&os.ModeSymlink != 0:
+			return 'l', nil
+		case fi.IsDir():
+			return 'd', nil
+		case fi.Mode().IsRegular():
+			return 'f', nil
+		}
+		return 'o', nil
+	}
+	out, err := ep.callOut(ctx, "kind", []string{agent.Arg(root), agent.Arg(sub)}, nil)
+	if err != nil {
+		return 0, err
+	}
+	k := strings.TrimSpace(string(out))
+	if k == "none" || k == "" {
+		return 0, nil
+	}
+	return k[0], nil
+}
+
 // Hash returns sha256 sums for paths (relative to Root), in order.
 func (ep *Endpoint) Hash(ctx context.Context, paths []string) ([]string, error) {
 	if len(paths) == 0 {

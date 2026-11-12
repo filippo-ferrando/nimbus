@@ -12,7 +12,9 @@ set -u
 umask 022
 STAGE=$(cd "$(dirname "$0")" && pwd) || exit 1
 LC_ALL=C
-export LC_ALL
+# macOS tar: do not add AppleDouble ._* entries to archives.
+COPYFILE_DISABLE=1
+export LC_ALL COPYFILE_DISABLE
 
 die() { printf 'nimbus-agent: %s\n' "$*" >&2; exit "${CODE:-1}"; }
 
@@ -157,6 +159,19 @@ list() {
 	fi
 }
 
+# kind ROOT SUB: print d, f, l, o (other) or none
+kind() {
+	r=$(root "$1"); sub=$(dec "${2:-}")
+	cd "$r" 2>/dev/null || { echo none; return 0; }
+	p=.
+	[ -n "$sub" ] && p=./$sub
+	if [ -h "$p" ]; then echo l
+	elif [ -d "$p" ]; then echo d
+	elif [ -f "$p" ]; then echo f
+	elif [ -e "$p" ]; then echo o
+	else echo none; fi
+}
+
 # hash ROOT < NUL-list: one sha256 line per file, in input order.
 hash() {
 	r=$(root "$1")
@@ -239,9 +254,8 @@ pack() {
 	n=0
 	while [ ! -f "$d.done" ]; do
 		if [ -f "$d.fail" ]; then
-			cat "$d.log" >&2 2>/dev/null
 			rm -f "$d.fail"
-			CODE=5 die "pack $key failed"
+			CODE=5 die "pack failed: $(grep -v '^pack failed' "$d.log" 2>/dev/null | head -n 2 | tr '\n' ' ')"
 		fi
 		pid=$(cat "$d.lock/pid" 2>/dev/null)
 		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && [ ! -f "$d.done" ]; then
@@ -312,20 +326,40 @@ send() { # send KEY [OFFSET]
 
 recv() { # recv KEY SHA < data
 	d=$STAGE/$1
-	cat >"$d.recv" || { rm -f "$d.recv"; exit 1; }
-	h=$(sha_of "$d.recv")
+	t=$d.recv.$$
+	cat >"$t" || { rm -f "$t"; exit 1; }
+	h=$(sha_of "$t")
 	if [ "$h" != "$2" ]; then
-		rm -f "$d.recv"
+		rm -f "$t"
 		CODE=3 die "checksum mismatch for $1: got $h"
 	fi
-	mv -f "$d.recv" "$d.data"
+	mv -f "$t" "$d.data"
 }
 
 # extract KEY KIND COMP ROOT [PATH SEEK]
+# Idempotent: an extract orphaned by a dropped connection may still be
+# running or may already have finished; wait for it and report success.
 extract() {
 	key=$1 kind=$2 comp=$3
 	r=$(root "$4")
 	d=$STAGE/$key
+	n=0
+	until mkdir "$d.xlock" 2>/dev/null; do
+		pid=$(cat "$d.xlock/pid" 2>/dev/null)
+		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+			rm -rf "$d.xlock"
+			continue
+		fi
+		n=$((n + 1))
+		[ $n -gt 6000 ] && die "extract $key: still locked"
+		sleep 0.2
+	done
+	echo $$ >"$d.xlock/pid"
+	trap 'rm -rf "$d.xlock"' EXIT
+	if [ -f "$d.x" ] || [ -f "$d.xt" ]; then
+		rm -f "$d.data"
+		return 0
+	fi
 	st=$d.xst
 	rm -f "$st"
 	[ -f "$d.data" ] || { CODE=4 die "missing $key"; }
@@ -345,13 +379,15 @@ extract() {
 		rm -f "$st"
 		die "extract $key failed"
 	fi
-	[ "$kind" = part ] && : >"$d.x"
-	[ "${NIMBUS_KEEP_DATA:-0}" = 1 ] || rm -f "$d.data"
+	# .x (parts) persists across runs; .xt (tar) only guards this run.
+	if [ "$kind" = part ]; then : >"$d.x"; else : >"$d.xt"; fi
+	rm -f "$d.data"
 }
 
 # state: list staged keys:  P key sha size (packed) | R key (received) | X key
 state() {
 	cd "$STAGE" || exit 0
+	rm -f ./*.xt
 	for f in *.done; do
 		[ -f "$f" ] || continue
 		printf 'P %s %s\n' "${f%.done}" "$(cat "$f")"
@@ -372,6 +408,21 @@ drop() { # drop KEY...
 	done
 }
 
+unmark() { # unmark < KEY lines: forget extracted-part markers
+	while read -r k; do
+		[ -n "$k" ] && rm -f "$STAGE/$k.x"
+	done
+	return 0
+}
+
+# reset: drop all staged state (keeps the agent).
+reset() {
+	cd "$STAGE" || exit 0
+	for f in * .[!.]*; do
+		case $f in agent.sh | env | "*" | ".[!.]*") ;; *) rm -rf "./$f" ;; esac
+	done
+}
+
 clean() {
 	case $STAGE in
 	*/nimbus-*) cd / && rm -rf "$STAGE" ;;
@@ -384,6 +435,7 @@ cmd=${1:-}
 case $cmd in
 probe) probe ;;
 list) load_env; list "$@" ;;
+kind) kind "$@" ;;
 hash) load_env; hash "$@" ;;
 mkdirs) mkdirs "$@" ;;
 rmrf) rmrf "$@" ;;
@@ -396,6 +448,8 @@ recv) load_env; recv "$@" ;;
 extract) load_env; extract "$@" ;;
 state) state ;;
 drop) drop "$@" ;;
+unmark) unmark ;;
+reset) reset ;;
 clean) clean ;;
 *) die "unknown command '$cmd'" ;;
 esac
