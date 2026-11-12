@@ -47,19 +47,19 @@ func run() int {
 	var (
 		blockS   = fs.StringP("block", "b", "64M", "batch / chunk size (K, M, G suffixes; multiple of 1M)")
 		jobs     = fs.IntP("jobs", "j", 4, "parallel pack / transfer / extract jobs")
-		conns    = fs.IntP("conns", "c", 0, "SSH connections (0 = one per job)")
-		comp     = fs.StringP("compress", "z", "auto", "compression: auto, zstd, gzip, none")
+		conns    = fs.Int("conns", 0, "SSH connections (0 = one per job)")
+		comp     = fs.String("compress", "auto", "compression: auto, zstd, gzip, none")
 		level    = fs.Int("level", 0, "compression level (0 = default: zstd 3, gzip 6)")
-		checksum = fs.BoolP("checksum", "C", false, "compare file contents by sha256 instead of size+mtime")
+		checksum = fs.BoolP("checksum", "c", false, "compare file contents by sha256 instead of size+mtime")
 		del      = fs.Bool("delete", false, "delete destination files that are not in the source")
 		dry      = fs.BoolP("dry-run", "n", false, "show what would be done, change nothing")
-		retries  = fs.IntP("retries", "r", 10, "attempts per operation before giving up")
+		retries  = fs.Int("retries", 10, "attempts per operation before giving up")
 		backoff  = fs.Duration("backoff", time.Second, "initial retry backoff (doubles, with jitter)")
 		backoffM = fs.Duration("backoff-max", time.Minute, "maximum retry backoff")
 		stall    = fs.Duration("timeout", 60*time.Second, "abort and retry a transfer with no progress for this long")
 		sshCmd   = fs.StringP("ssh-cmd", "e", "", `use the system ssh binary, e.g. "ssh" or "ssh -J bastion"`)
-		port     = fs.IntP("port", "p", 0, "SSH port")
-		ident    = fs.StringP("identity", "i", "", "SSH private key file")
+		port     = fs.Int("port", 0, "SSH port")
+		ident    = fs.String("identity", "", "SSH private key file")
 		staging  = fs.String("staging", "/var/tmp", "staging directory on both endpoints")
 		keep     = fs.Bool("keep-staging", false, "do not delete staged data after success")
 		fresh    = fs.Bool("fresh", false, "ignore staged data from interrupted runs")
@@ -69,10 +69,12 @@ func run() int {
 		verbose  = fs.BoolP("verbose", "v", false, "more details")
 		showVer  = fs.BoolP("version", "V", false, "print version")
 	)
-	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, usage)
-		fs.PrintDefaults()
+	// rsync habits: accepted and ignored (nimbus always behaves like -a).
+	for _, c := range rsyncNoops {
+		fs.BoolP("rsync-"+c, c, false, "")
+		_ = fs.MarkHidden("rsync-" + c)
 	}
+	fs.Usage = func() { printUsage(fs) }
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -232,6 +234,10 @@ func run() int {
 		}
 		return 1
 	}
+	if res != nil && res.Blocked > 0 {
+		u.Warn("%d entries could not be updated (see warnings above)", res.Blocked)
+		return 23
+	}
 	return 0
 }
 
@@ -277,6 +283,48 @@ func printSummary(u *ui.UI, eng *engine.Engine, res *engine.Result, err error) {
 	}
 	u.Summary(true, "Transfer complete", rows)
 }
+
+func printUsage(fs *flag.FlagSet) {
+	fmt.Fprint(os.Stderr, usage)
+	type row struct{ left, right string }
+	var rows []row
+	width := 0
+	fs.VisitAll(func(f *flag.Flag) {
+		if f.Hidden {
+			return
+		}
+		left := "    "
+		if f.Shorthand != "" {
+			left = "-" + f.Shorthand + ", "
+		}
+		left += "--" + f.Name
+		if t := f.Value.Type(); t != "bool" {
+			left += " " + map[string]string{"string": "STR", "int": "N", "duration": "DUR"}[t]
+		}
+		right := f.Usage
+		if d := f.DefValue; d != "" && d != "false" && d != "0" {
+			right += fmt.Sprintf(" (default %s)", d)
+		}
+		rows = append(rows, row{left, right})
+		if len(left) > width {
+			width = len(left)
+		}
+	})
+	for _, r := range rows {
+		fmt.Fprintf(os.Stderr, "  %-*s  %s\n", width, r.left, r.right)
+	}
+	fmt.Fprintf(os.Stderr, `
+rsync compatibility: -%s are accepted and ignored.
+nimbus always recurses and keeps symlinks, permissions and mtimes; ownership
+is kept only when extracting as root. Hard links, ACLs and xattrs are not
+preserved.
+
+Exit codes: 0 ok, 1 transfer failed (rerun to resume), 2 usage error,
+            23 some entries could not be updated, 130 interrupted.
+`, strings.Join(rsyncNoops, " -"))
+}
+
+var rsyncNoops = []string{"a", "r", "l", "t", "p", "g", "o", "D", "P", "h", "z"}
 
 func remoteKey(s engine.Spec) string {
 	if !s.Remote {
