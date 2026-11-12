@@ -24,6 +24,9 @@ type Diff struct {
 type DiffOptions struct {
 	Checksum bool
 	Delete   bool
+	// Protected lists destination directories that contain excluded entries:
+	// they are never removed as a whole.
+	Protected map[string]bool
 }
 
 // ComputeDiff compares source and destination listings. Paths are relative to
@@ -63,7 +66,7 @@ func ComputeDiff(src, dst []Entry, o DiffOptions) *Diff {
 			de = nil
 		}
 		if de != nil && de.Type != s.Type {
-			if de.Type == 'd' && !o.Delete {
+			if de.Type == 'd' && (!o.Delete || o.Protected[s.Path]) {
 				d.Blocked = append(d.Blocked, s.Path)
 				continue
 			}
@@ -114,8 +117,13 @@ func ComputeDiff(src, dst []Entry, o DiffOptions) *Diff {
 			if _, ok := smap[e.Path]; isPart(e.Path) || ok {
 				continue
 			}
-			// Only the top-most missing entry; rm -rf handles the rest.
-			if !topMost(e.Path, smap) {
+			// Only the top-most missing entry (rm -rf handles the rest),
+			// except below directories that hold excluded entries: those are
+			// kept and only their other children are removed.
+			if o.Protected[e.Path] {
+				continue
+			}
+			if dir, _ := splitPath(e.Path); !topMost(e.Path, smap) && !(o.Protected[dir] && smap[dir] == 0) {
 				continue
 			}
 			d.Delete = append(d.Delete, e.Path)

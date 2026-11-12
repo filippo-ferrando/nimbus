@@ -148,14 +148,16 @@ list() {
 		find "$start" -printf '%y %s %T@ %m\0%p\0%l\0'
 	else
 		echo "#stat-$STATF"
+		s=0
 		if [ "$STATF" = gnu ]; then
-			find "$start" -exec stat -c '%f %s %Y %n' {} +
+			find "$start" -exec stat -c '%f %s %Y %n' {} + || s=1
 		else
-			find "$start" -exec stat -f '%p %z %m %N' {} +
+			find "$start" -exec stat -f '%p %z %m %N' {} + || s=1
 		fi
 		printf '#links\n'
 		find "$start" -type l -exec sh -c \
-			'for f; do printf "%s\0%s\0" "$f" "$(readlink "$f")"; done' sh {} +
+			'for f; do printf "%s\0%s\0" "$f" "$(readlink "$f")"; done' sh {} + || s=1
+		return $s
 	fi
 }
 
@@ -170,6 +172,19 @@ kind() {
 	elif [ -f "$p" ]; then echo f
 	elif [ -e "$p" ]; then echo o
 	else echo none; fi
+}
+
+# exists ROOT < NUL-list: one line per path, 1 if it exists (any type) else 0
+exists() {
+	r=$(root "$1")
+	t=$STAGE/ex.$$
+	cat >"$t"
+	if cd "$r" 2>/dev/null; then
+		xargs -0 sh -c 'for f; do if [ -e "$f" ] || [ -h "$f" ]; then echo 1; else echo 0; fi; done' sh <"$t"
+	else
+		tr -cd '\0' <"$t" | tr '\0' '\n' | sed 's/.*/0/'
+	fi
+	rm -f "$t"
 }
 
 # hash ROOT < NUL-list: one sha256 line per file, in input order.
@@ -229,7 +244,8 @@ finish() {
 	cat >"$t"
 	s=0
 	if [ -s "$t" ]; then
-		xargs -0 -n 2 sh -c 'mv -f "$1" "$2"' sh <"$t" || s=1
+		# Idempotent: a retried finish whose rename already happened succeeds.
+		xargs -0 -n 2 sh -c 'if [ -f "$1" ]; then mv -f "$1" "$2"; else [ -f "$2" ]; fi' sh <"$t" || s=1
 	fi
 	rm -f "$t"
 	return $s
@@ -242,35 +258,40 @@ finish() {
 pack() {
 	key=$1
 	d=$STAGE/$key
-	if [ -f "$d.done" ]; then cat >/dev/null; cat "$d.done"; return 0; fi
-	if mkdir "$d.lock" 2>/dev/null; then
-		cat >"$d.list"
-		rm -f "$d.fail"
-		nohup sh "$STAGE/agent.sh" _pack "$@" </dev/null >"$d.log" 2>&1 &
-		echo $! >"$d.lock/pid"
-	else
-		cat >/dev/null
-	fi
-	n=0
-	while [ ! -f "$d.done" ]; do
-		if [ -f "$d.fail" ]; then
+	in=$d.in.$$
+	cat >"$in"
+	tries=0
+	while :; do
+		if [ -f "$d.done" ]; then rm -f "$in"; cat "$d.done"; return 0; fi
+		if mkdir "$d.lock" 2>/dev/null; then
+			cp "$in" "$d.list"
 			rm -f "$d.fail"
-			CODE=5 die "pack failed: $(grep -v '^pack failed' "$d.log" 2>/dev/null | head -n 2 | tr '\n' ' ')"
+			nohup sh "$STAGE/agent.sh" _pack "$@" </dev/null >"$d.log" 2>&1 &
+			echo $! >"$d.lock/pid"
 		fi
-		pid=$(cat "$d.lock/pid" 2>/dev/null)
-		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && [ ! -f "$d.done" ]; then
+		n=0
+		while [ ! -f "$d.done" ]; do
+			if [ -f "$d.fail" ]; then
+				rm -f "$d.fail" "$in"
+				CODE=5 die "pack failed: $(grep -v '^pack failed' "$d.log" 2>/dev/null | head -n 2 | tr '\n' ' ')"
+			fi
+			pid=$(cat "$d.lock/pid" 2>/dev/null)
+			if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+				sleep 0.2
+				[ -f "$d.done" ] && break
+				rm -rf "$d.lock" # packer died (killed, reboot...): take over
+				break
+			fi
+			if [ -z "$pid" ]; then
+				n=$((n + 1))
+				[ $n -gt 50 ] && { rm -rf "$d.lock"; break; }
+			fi
 			sleep 0.2
-			[ -f "$d.done" ] && break
-			rm -rf "$d.lock"
-			CODE=5 die "pack $key: packer died"
-		fi
-		if [ -z "$pid" ]; then
-			n=$((n + 1))
-			[ $n -gt 50 ] && { rm -rf "$d.lock"; CODE=5 die "pack $key: stale lock"; }
-		fi
-		sleep 0.2
+		done
+		[ -f "$d.done" ] && continue
+		tries=$((tries + 1))
+		[ $tries -gt 3 ] && { rm -f "$in"; CODE=5 die "pack $key: packer keeps dying"; }
 	done
-	cat "$d.done"
 }
 
 _pack() {
@@ -435,6 +456,7 @@ cmd=${1:-}
 case $cmd in
 probe) probe ;;
 list) load_env; list "$@" ;;
+exists) exists "$@" ;;
 kind) kind "$@" ;;
 hash) load_env; hash "$@" ;;
 mkdirs) mkdirs "$@" ;;

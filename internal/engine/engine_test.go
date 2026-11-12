@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"strings"
+	"sort"
 	"testing"
 
 	"git.fferrando.cc/rdfilippo/nimbus/internal/agent"
@@ -232,7 +232,6 @@ func TestAgentArgRoundTrip(t *testing.T) {
 			t.Errorf("roundtrip %q -> %q (%s)", s, out, agent.Arg(s))
 		}
 	}
-	_ = strings.TrimSpace
 }
 
 func TestFilter(t *testing.T) {
@@ -280,5 +279,27 @@ func TestFilter(t *testing.T) {
 	}
 	if !reflect.DeepEqual(paths, []string{"src", "src/keep"}) {
 		t.Errorf("apply = %v", paths)
+	}
+}
+
+func TestDeleteKeepsExcluded(t *testing.T) {
+	f, _ := NewFilter([]string{"*.tmp"})
+	src := []Entry{{Path: "", Type: 'd'}, {Path: "keep", Type: 'f'}, {Path: "conflict", Type: 'f'}}
+	full := []Entry{
+		{Path: "", Type: 'd'}, {Path: "keep", Type: 'f'},
+		{Path: "junk", Type: 'd'}, {Path: "junk/x.tmp", Type: 'f'}, {Path: "junk/y", Type: 'f'},
+		{Path: "junk/sub", Type: 'd'}, {Path: "junk/sub/z", Type: 'f'},
+		{Path: "gone", Type: 'd'}, {Path: "gone/w", Type: 'f'},
+		{Path: "conflict", Type: 'd'}, {Path: "conflict/a.tmp", Type: 'f'},
+	}
+	dst := f.Apply(append([]Entry(nil), full...), "")
+	prot := map[string]bool{"": true, "junk": true, "conflict": true}
+	d := ComputeDiff(src, dst, DiffOptions{Delete: true, Protected: prot})
+	sort.Strings(d.Delete)
+	if !reflect.DeepEqual(d.Delete, []string{"gone", "junk/sub", "junk/y"}) {
+		t.Errorf("delete = %v", d.Delete)
+	}
+	if !reflect.DeepEqual(d.Blocked, []string{"conflict"}) {
+		t.Errorf("blocked = %v", d.Blocked)
 	}
 }

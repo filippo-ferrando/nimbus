@@ -218,9 +218,28 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 				srcList[i].Path = e.Dst.Sub
 			}
 		}
-	} else if !e.O.Exclude.Empty() {
+	}
+	var protected map[string]bool
+	if e.renameFrom == "" && !e.O.Exclude.Empty() {
 		srcList = e.O.Exclude.Apply(srcList, e.Src.Sub)
-		dstList = e.O.Exclude.Apply(dstList, e.Dst.Sub)
+		full := dstList
+		kept := map[string]bool{}
+		dstList = e.O.Exclude.Apply(append([]Entry(nil), full...), e.Dst.Sub)
+		for _, de := range dstList {
+			kept[de.Path] = true
+		}
+		// Directories holding excluded entries must never be removed whole.
+		protected = map[string]bool{}
+		for _, de := range full {
+			if !kept[de.Path] {
+				for dir, _ := splitPath(de.Path); ; dir, _ = splitPath(dir) {
+					protected[dir] = true
+					if dir == "" {
+						break
+					}
+				}
+			}
+		}
 	}
 	_ = dstSkip
 	if !e.Src.T.IsLocal() || e.Src.Info["tarnull"] != "1" || e.Dst.Info["tarnull"] != "1" {
@@ -231,7 +250,7 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 		}
 	}
 
-	d := ComputeDiff(srcList, dstList, DiffOptions{Checksum: e.O.Checksum, Delete: e.O.Delete})
+	d := ComputeDiff(srcList, dstList, DiffOptions{Checksum: e.O.Checksum, Delete: e.O.Delete, Protected: protected})
 	if len(d.CheckSum) > 0 {
 		u.Phase("Comparing checksums of %s files", ui.Count(int64(len(d.CheckSum))))
 		paths := make([]string, len(d.CheckSum))
@@ -296,13 +315,7 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	}
 
 	// 5. prepare destination tree
-	partials := map[string]bool{}
-	for _, de := range dstList {
-		if de.Type == 'f' && isPart(de.Path) {
-			partials[de.Path] = true
-		}
-	}
-	if err := e.prepareDest(ctx, d, batches, partials); err != nil {
+	if err := e.prepareDest(ctx, d, batches); err != nil {
 		return nil, err
 	}
 
@@ -531,7 +544,7 @@ func (e *Engine) loadState(ctx context.Context) error {
 
 // ---------------------------------------------------------------- prepare
 
-func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch, partials map[string]bool) error {
+func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch) error {
 	dst := e.Dst
 	root := agent.Arg(dst.Root)
 	if len(d.Replace) > 0 {
@@ -555,7 +568,33 @@ func (e *Engine) prepareDest(ctx context.Context, d *Diff, batches []*Batch, par
 		byPath[s.Path] = s
 	}
 	// Part markers from a previous run only count while the partial file
-	// they were written into still exists.
+	// they were written into still exists: ask the destination directly (the
+	// listing may not cover it, e.g. for a single-file source).
+	partials := map[string]bool{}
+	var names []string
+	seenP := map[string]bool{}
+	for _, b := range batches {
+		if b.Kind == "part" && e.dstState.extracted[b.Key] && !seenP[b.Path] {
+			seenP[b.Path] = true
+			names = append(names, partName(b.Path))
+		}
+	}
+	if len(names) > 0 {
+		var out []byte
+		if err := e.do(ctx, "check partial files", []*Endpoint{dst}, func(ctx context.Context) (err error) {
+			out, err = dst.callOut(ctx, "exists", []string{root}, nulList(names))
+			return
+		}); err != nil {
+			return err
+		}
+		res := strings.Fields(string(out))
+		if len(res) != len(names) {
+			return fmt.Errorf("exists: got %d answers for %d paths", len(res), len(names))
+		}
+		for i, n := range names {
+			partials[n] = res[i] == "1"
+		}
+	}
 	started := map[string]bool{}
 	var invalid []string
 	for _, b := range batches {
@@ -867,8 +906,10 @@ func (e *Engine) send(ctx context.Context, b *Batch, sha string, size int64, sem
 		var sendErr, recvErr error
 		var wg sync.WaitGroup
 		wg.Add(2)
+		sent := make(chan struct{})
 		go func() {
 			defer wg.Done()
+			defer close(sent)
 			sendErr = e.Src.T.Run(actx, e.Src.argv("send", b.Key), nil, pwr, nil)
 			if sendErr != nil {
 				cancel(sendErr)
@@ -890,6 +931,10 @@ func (e *Engine) send(ctx context.Context, b *Batch, sha string, size int64, sem
 			for {
 				select {
 				case <-stop:
+					return
+				case <-sent:
+					// The receiver may hash for a while after the last byte;
+					// keepalives cover dead connections from here on.
 					return
 				case <-tk.C:
 					if time.Since(time.Unix(0, pwr.last.Load())) > e.O.Stall {
@@ -941,11 +986,18 @@ func (e *Engine) partDone(ctx context.Context, b *Batch) error {
 	}
 	dst := e.Dst
 	root := agent.Arg(dst.Root)
+	// Attributes go on the partial first, so the rename is the last step and
+	// a retried finish is harmless.
+	part := ent
+	part.Path = partName(b.Path)
 	return e.do(ctx, "finish "+b.Path, []*Endpoint{dst}, func(ctx context.Context) error {
-		if err := dst.call(ctx, "finish", []string{root}, bytes.NewReader(nulFields(rel(partName(b.Path)), rel(b.Path))), nil); err != nil {
-			return err
+		if err := dst.call(ctx, "meta", []string{root}, bytes.NewReader(metaRecord(part)), nil); err != nil {
+			// already renamed by an earlier attempt: fall through to finish
+			if transport.IsConnErr(err) {
+				return err
+			}
 		}
-		return dst.call(ctx, "meta", []string{root}, bytes.NewReader(metaRecord(ent)), nil)
+		return dst.call(ctx, "finish", []string{root}, bytes.NewReader(nulFields(rel(partName(b.Path)), rel(b.Path))), nil)
 	})
 }
 
