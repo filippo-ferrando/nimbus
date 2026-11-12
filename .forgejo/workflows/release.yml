@@ -6,15 +6,15 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   release:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: golang:1.27
     env:
-      CGO_ENABLED: '0'
+      CGO_ENABLED: "0"
       TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SERVER: ${{ github.server_url }}
       REPO: ${{ github.repository }}
