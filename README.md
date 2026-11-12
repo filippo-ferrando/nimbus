@@ -147,6 +147,22 @@ If the link's total bandwidth is the bottleneck, more jobs do not help.
 | Built-in SSH: keys, ssh-agent, known_hosts (strict, prompt, key-type negotiation) | tested |
 | Built-in SSH: password, key passphrase, keyboard-interactive | implemented, not yet tested |
 
+## Testing
+
+```
+go test ./...          # unit tests
+test/e2e.sh            # end-to-end: starts a throwaway sshd on 127.0.0.1
+test/e2e.sh -b         # ... plus the rsync benchmark above
+test/e2e.sh resume     # only some groups (local push pull sshcmd delete rename
+                       # compat checksum errors resume network bench)
+```
+
+The end-to-end suite builds nimbus, generates test trees (awkward names, long
+paths, symlinks, permissions), and covers interrupt/resume, killed and frozen
+connections, `--delete`/`--exclude`, bsdtar interoperability and host key
+checks. It needs `sshd`, about 4 GB in `$NIMBUS_E2E_DIR` (default `/var/tmp`),
+and removes everything when done.
+
 ## Limitations
 
 - Ownership is preserved only when extracting as root; hard links, ACLs,
