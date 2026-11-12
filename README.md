@@ -4,8 +4,8 @@
 
 # nimbus
 
-Resumable, parallel, compressed file synchronization over SSH: a drop-in
-for the common `rsync -a` use cases, built for big transfers over slow or
+Resumable, parallel, compressed file synchronization over SSH. It covers the
+common `rsync -a` use cases and is built for big transfers over slow or
 unreliable links.
 
 ```
@@ -18,8 +18,8 @@ nimbus -n --delete src/ host:dst        # dry run: show what would change
 
 - **rsync semantics**: `[user@]host:path` locations, `src` vs `src/`
   (directory itself vs its contents), only new/changed files are sent
-  (size + mtime, or sha256 with `-c`), optional `--delete`, `--dry-run`.
-  Common rsync flags (`-avzhP`, …) are accepted.
+  (size + mtime, or sha256 with `-c`), `--exclude`, optional `--delete`,
+  `--dry-run`. Common rsync flags (`-avzhP`, …) are accepted.
 - **Parallel and pipelined**: changes are grouped into independent batches
   (small files are tarred together, large files are split into chunks). Packing,
   transfer and extraction run concurrently over several SSH connections, each
@@ -28,15 +28,15 @@ nimbus -n --delete src/ host:dst        # dry run: show what would change
   pigz/gzip, or none. Use `--compress none` for already-compressed data.
 - **Verified**: every batch is sha256-checked on the destination before it is
   extracted; nothing is extracted or cleaned up after a failed check.
-- **Resilient**: every operation retries with exponential backoff and full
-  jitter; dropped connections are re-established without prompting again;
-  stalled transfers are detected (`--timeout`) and retried.
+- **Resilient**: connection failures, stalls (`--timeout`) and checksum
+  mismatches are retried with exponential backoff and full jitter; dead
+  connections are detected and re-established without prompting again. Other
+  errors (permission denied, disk full, …) abort the run immediately.
 - **Resumable**: interrupt it (Ctrl-C, network loss, reboot) and run the same
   command again; finished batches and staged data are reused. Packing on a
   remote source runs detached, so it survives a dropped connection.
 - **Nothing to install remotely**: the remote side only needs `sh`, `tar`,
-  `find`/`stat` and a sha256 tool. GNU/Linux, BusyBox and macOS/BSD userlands
-  are supported.
+  `find`/`stat` and a sha256 tool (see [Compatibility](#compatibility)).
 - **One password prompt**: the built-in SSH client authenticates once (agent,
   keys, passphrase, password or keyboard-interactive) and opens all
   connections with it. `known_hosts` is verified strictly.
@@ -58,8 +58,10 @@ go build -o nimbus .
 nimbus [options] SRC DST
 ```
 
-`DST` is always a directory and is created if missing. Remote to remote is not
-supported: run nimbus on one of the hosts.
+`DST` is a directory, created if missing. As in rsync, when `SRC` is a single
+file and `DST` has no trailing slash and is not an existing directory, `DST` is
+the new file name (`nimbus disk.img host:/backup/disk-2024.img`). Remote to
+remote is not supported: run nimbus on one of the hosts.
 
 | Option | Default | |
 |---|---|---|
@@ -71,14 +73,20 @@ supported: run nimbus on one of the hosts.
 | `-c, --checksum` | | compare contents by sha256 instead of size+mtime |
 | `--delete` | | delete destination entries missing from the source (only inside the synced tree; refused if the source is empty) |
 | `-n, --dry-run` | | print the plan, change nothing |
+| `--exclude PATTERN`, `--exclude-from FILE` | | skip matching entries (repeatable, see below); excluded destination entries are never deleted |
 | `--retries N` | `10` | attempts per operation |
 | `--backoff DUR`, `--backoff-max DUR` | `1s`, `1m` | exponential backoff with full jitter |
 | `--timeout DUR` | `60s` | retry a transfer that made no progress for this long |
 | `-e, --ssh-cmd CMD` | | use the system ssh (e.g. `"ssh -J bastion"`) instead of the built-in client |
+| `-F, --ssh-config FILE` | `~/.ssh/config` | ssh config for both clients |
 | `--port N`, `--identity FILE` | | SSH port / key |
 | `--staging DIR` | `/var/tmp` | staging directory on both endpoints |
 | `--keep-staging`, `--fresh` | | keep staged data after success / ignore data from interrupted runs |
 | `--plain`, `--no-color`, `-q`, `-v` | | output control (`NO_COLOR` is honoured) |
+
+Exclude patterns follow rsync: `name` matches at any depth, `dir/` matches
+directories only, `/top` is anchored at the transfer root, `a/b` matches the
+end of a path, `*`/`?` do not cross `/`, `**` does.
 
 Exit codes: `0` ok, `1` transfer failed (rerun to resume), `2` usage error,
 `23` some entries could not be updated, `130` interrupted.
@@ -86,13 +94,14 @@ Exit codes: `0` ok, `1` transfer failed (rerun to resume), `2` usage error,
 ### SSH
 
 The built-in client reads `~/.ssh/config` (`HostName`, `User`, `Port`,
-`IdentityFile`, `UserKnownHostsFile`, `HostKeyAlias`), uses `ssh-agent`, and
-asks before trusting an unknown host key. Hosts that need `ProxyJump` or
-`ProxyCommand` must use `--ssh-cmd ssh`, which drives your ssh binary with one
-ControlMaster per connection. With `--ssh-cmd`, if key authentication is not
-available, nimbus falls back to a single connection so you are prompted only
-once (override with `--conns`). `NIMBUS_SSH_CONFIG` points the built-in client
-at a different ssh config file.
+`IdentityFile`, `UserKnownHostsFile`, `HostKeyAlias`; `Match` blocks are
+ignored), uses `ssh-agent`, verifies `known_hosts` strictly and asks before
+trusting an unknown host key. Hosts configured with `ProxyJump` or
+`ProxyCommand` automatically use the system ssh; for `Match` blocks or other
+advanced options pass `--ssh-cmd ssh`. The system ssh is driven with one
+ControlMaster per connection; if key authentication is not available, nimbus
+uses a single connection so you are prompted only once (override with
+`--conns`). `NIMBUS_SSH_CONFIG` is read when `-F` is not given.
 
 ## How it works
 
@@ -109,6 +118,34 @@ at a different ssh config file.
    mtimes/permissions, staging cleanup.
 
 Staging needs at most about `2 × jobs × block` of free space on each side.
+
+## Performance
+
+On a single fast link with no per-connection limit, nimbus is about as fast as
+rsync (it stages data on disk, so it is slightly slower on loopback). It wins
+when each TCP connection is limited: high latency, per-flow shaping, VPNs,
+lossy links. Measured with a proxy limiting every connection to 20 MB/s
+(510 MB: one 200 MB file and 2,000 small files):
+
+| | time |
+|---|---|
+| `rsync -a` | 26.6 s |
+| `nimbus -j1` | 26.6 s |
+| `nimbus -j4` | 9.5 s |
+| `nimbus -j8` | 3.9 s |
+
+If the link's total bandwidth is the bottleneck, more jobs do not help.
+
+## Compatibility
+
+| | status |
+|---|---|
+| GNU/Linux (GNU tar, find, coreutils) | tested |
+| bsdtar instead of GNU tar | tested |
+| BusyBox (no GNU `find -printf` / `tar --null`) | code path tested with GNU tools in compatibility mode, not on real BusyBox |
+| macOS / FreeBSD (`stat -f`, bsdtar) | implemented, not yet tested on real systems |
+| Built-in SSH: keys, ssh-agent, known_hosts (strict, prompt, key-type negotiation) | tested |
+| Built-in SSH: password, key passphrase, keyboard-interactive | implemented, not yet tested |
 
 ## Limitations
 

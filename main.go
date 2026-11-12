@@ -32,7 +32,8 @@ Usage:
 Locations are local paths or [user@]host:path (rsync syntax).
   SRC  without trailing slash copies the directory itself: DST/name/...
   SRC/ with trailing slash copies its contents:             DST/...
-DST is always a directory and is created if missing.
+DST is a directory (created if missing), except that a single-file SRC is
+written as DST itself when DST has no trailing slash and is not a directory.
 
 Options:
 `
@@ -58,6 +59,9 @@ func run() int {
 		backoffM = fs.Duration("backoff-max", time.Minute, "maximum retry backoff")
 		stall    = fs.Duration("timeout", 60*time.Second, "abort and retry a transfer with no progress for this long")
 		sshCmd   = fs.StringP("ssh-cmd", "e", "", `use the system ssh binary, e.g. "ssh" or "ssh -J bastion"`)
+		sshCfg   = fs.StringP("ssh-config", "F", "", "ssh config file (default ~/.ssh/config)")
+		excludes = fs.StringArray("exclude", nil, "exclude matching files (rsync patterns, repeatable)")
+		exclFrom = fs.StringArray("exclude-from", nil, "read exclude patterns from FILE")
 		port     = fs.Int("port", 0, "SSH port")
 		ident    = fs.String("identity", "", "SSH private key file")
 		staging  = fs.String("staging", "/var/tmp", "staging directory on both endpoints")
@@ -112,6 +116,28 @@ func run() int {
 		return fail("--staging must be an absolute path")
 	}
 
+	patterns := append([]string{}, *excludes...)
+	for _, f := range *exclFrom {
+		ps, err := engine.ReadPatterns(f)
+		if err != nil {
+			return fail("--exclude-from: %v", err)
+		}
+		patterns = append(patterns, ps...)
+	}
+	filter, err := engine.NewFilter(patterns)
+	if err != nil {
+		return fail("%v", err)
+	}
+	cfgFile := *sshCfg
+	if cfgFile == "" {
+		cfgFile = os.Getenv("NIMBUS_SSH_CONFIG")
+	}
+	if cfgFile != "" {
+		if err := transport.SetConfigFile(cfgFile); err != nil {
+			return fail("--ssh-config: %v", err)
+		}
+	}
+
 	src, err := engine.ParseSpec(fs.Arg(0))
 	if err != nil {
 		return fail("source: %v", err)
@@ -160,7 +186,8 @@ func run() int {
 	// Prevent two concurrent runs of the same transfer.
 	lock, err := lockFile(filepath.Join(*staging, "nimbus-"+id+".lock"))
 	if err != nil {
-		return fail("%v", err)
+		u.Error("%v", err)
+		return 1
 	}
 	defer lock()
 
@@ -177,8 +204,18 @@ func run() int {
 		}
 		u.Phase("Connecting to %s", rs.Dest())
 		logf := func(f string, a ...any) { u.Warn(f, a...) }
-		if *sshCmd != "" {
-			argv := splitWords(*sshCmd)
+		cmdline := *sshCmd
+		if cmdline == "" {
+			if why := transport.NeedsSystemSSH(rs.Host); why != "" {
+				u.Info("%s uses %s: using the system ssh client", rs.Host, why)
+				cmdline = "ssh"
+			}
+		}
+		if cmdline != "" {
+			argv := splitWords(cmdline)
+			if *sshCfg != "" {
+				argv = append(argv, "-F", *sshCfg)
+			}
 			if *conns <= 0 && nconns > 1 && !transport.BatchModeWorks(ctx, argv, rs.Dest()) {
 				u.Warn("ssh needs interactive authentication: using a single connection (set -c N to override)")
 				nconns = 1
@@ -189,7 +226,8 @@ func run() int {
 				transport.NativeOptions{Conns: nconns, Logf: logf})
 		}
 		if err != nil {
-			return fail("%v", err)
+			u.Error("%v", err)
+			return 1
 		}
 		defer remote.Close()
 		u.OK("Connected to %s (%d connections)", remote.Name(), nconns)
@@ -219,6 +257,8 @@ func run() int {
 			Retry:       retry.Policy{Attempts: *retries, Base: *backoff, Max: *backoffM},
 			Stall:       *stall,
 			KeepStaging: *keep, Fresh: *fresh,
+			Exclude:      filter,
+			RenameTarget: renameTarget(dst.Path, dstRoot),
 		},
 	}
 	res, err := eng.Run(ctx)
@@ -325,6 +365,17 @@ Exit codes: 0 ok, 1 transfer failed (rerun to resume), 2 usage error,
 }
 
 var rsyncNoops = []string{"a", "r", "l", "t", "p", "g", "o", "D", "P", "h", "z"}
+
+// renameTarget returns the destination path eligible for rsync's single-file
+// rename rule, or "" when DST explicitly names a directory.
+func renameTarget(raw, root string) string {
+	switch {
+	case strings.HasSuffix(raw, "/"), raw == "~", raw == ".", raw == "..",
+		strings.HasSuffix(raw, "/."), strings.HasSuffix(raw, "/.."), root == "/":
+		return ""
+	}
+	return root
+}
 
 func remoteKey(s engine.Spec) string {
 	if !s.Remote {
