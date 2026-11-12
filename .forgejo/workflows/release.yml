@@ -1,0 +1,58 @@
+# Builds nimbus for every target and publishes a Forgejo release on v* tags.
+# Uses only git/curl/go (no JavaScript actions), so it runs in the plain
+# golang image.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: golang:1.27
+    env:
+      CGO_ENABLED: '0'
+      TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SERVER: ${{ github.server_url }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        run: |
+          git clone --depth 1 --branch "$TAG" \
+            "$(echo "$SERVER" | sed "s#://#://oauth2:${TOKEN}@#")/${REPO}.git" src
+
+      - name: Test
+        working-directory: src
+        run: go vet ./... && go test ./...
+
+      - name: Build
+        working-directory: src
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 freebsd/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            out="dist/nimbus-${TAG}-${os}-${arch}"
+            GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${TAG}" -o "$out" .
+            echo "built $out"
+          done
+          (cd dist && sha256sum nimbus-* > SHA256SUMS)
+
+      - name: Publish release
+        working-directory: src
+        run: |
+          api="${SERVER}/api/v1/repos/${REPO}"
+          resp=$(curl -fsS -X POST "$api/releases" \
+            -H "Authorization: token ${TOKEN}" -H 'Content-Type: application/json' \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"nimbus ${TAG}\",\"body\":\"Release ${TAG}: binaries for linux, macOS and FreeBSD. Verify with SHA256SUMS.\"}")
+          id=$(printf '%s' "$resp" | grep -o '"id":[0-9]*' | head -n1 | cut -d: -f2)
+          [ -n "$id" ] || { echo "release creation failed: $resp"; exit 1; }
+          for f in dist/*; do
+            curl -fsS -X POST "$api/releases/${id}/assets?name=$(basename "$f")" \
+              -H "Authorization: token ${TOKEN}" -F "attachment=@${f}" >/dev/null
+            echo "uploaded $(basename "$f")"
+          done
