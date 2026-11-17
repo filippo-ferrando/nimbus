@@ -1,6 +1,11 @@
 # Builds nimbus for every target and publishes a Forgejo release on v* tags.
 # Uses only git/curl/go (no JavaScript actions), so it runs in the plain
 # golang image.
+#
+# The release body contains the matching CHANGELOG.md section, install
+# instructions and the SHA256SUMS of the binaries built in this run. Re-running
+# the workflow for a tag that already has a release updates it in place: the
+# body (and therefore the checksums) is rewritten and every asset is replaced.
 name: release
 
 on:
@@ -40,19 +45,77 @@ jobs:
               -ldflags "-s -w -X main.version=${TAG}" -o "$out" .
             echo "built $out"
           done
-          (cd dist && sha256sum nimbus-* > SHA256SUMS)
+          (cd dist && sha256sum nimbus-* > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Release notes
+        working-directory: src
+        run: |
+          version=${TAG#v}
+          download="${SERVER}/${REPO}/releases/download/${TAG}"
+          {
+            # Section of CHANGELOG.md for this version, without its heading.
+            notes=$(awk -v v="$version" '
+              /^## \[/ { if (on) exit; on = index($0, "## [" v "]") == 1; next }
+              /^\[[^]]+\]: / { if (on) exit }
+              on' CHANGELOG.md 2>/dev/null | sed -e '/./,$!d')
+            if [ -n "$notes" ]; then
+              printf '%s\n\n' "$notes"
+            else
+              printf 'nimbus %s: binaries for linux, macOS and FreeBSD.\n\n' "$TAG"
+            fi
+
+            printf '## Install\n\n```sh\n'
+            printf 'curl -fLO %s/nimbus-%s-linux-amd64   # pick your platform below\n' "$download" "$TAG"
+            printf 'curl -fLO %s/SHA256SUMS\n' "$download"
+            printf 'sha256sum --ignore-missing -c SHA256SUMS\n'
+            printf 'chmod +x nimbus-%s-linux-amd64 && sudo mv nimbus-%s-linux-amd64 /usr/local/bin/nimbus\n' "$TAG" "$TAG"
+            printf '```\n\n'
+
+            printf '## Checksums\n\n'
+            printf '| Platform | File | SHA-256 |\n|---|---|---|\n'
+            while read -r sum file; do
+              platform=${file#nimbus-${TAG}-}
+              printf '| %s | [`%s`](%s/%s) | `%s` |\n' "$platform" "$file" "$download" "$file" "$sum"
+            done < dist/SHA256SUMS
+            printf '\n<details><summary>SHA256SUMS</summary>\n\n```\n'
+            cat dist/SHA256SUMS
+            printf '```\n\n</details>\n'
+          } > notes.md
+          cat notes.md
 
       - name: Publish release
         working-directory: src
         run: |
           api="${SERVER}/api/v1/repos/${REPO}"
-          resp=$(curl -fsS -X POST "$api/releases" \
-            -H "Authorization: token ${TOKEN}" -H 'Content-Type: application/json' \
-            -d "{\"tag_name\":\"${TAG}\",\"name\":\"nimbus ${TAG}\",\"body\":\"Release ${TAG}: binaries for linux, macOS and FreeBSD. Verify with SHA256SUMS.\"}")
-          id=$(printf '%s' "$resp" | grep -o '"id":[0-9]*' | head -n1 | cut -d: -f2)
-          [ -n "$id" ] || { echo "release creation failed: $resp"; exit 1; }
+          auth="Authorization: token ${TOKEN}"
+          # JSON-encode the release notes (no jq in the image).
+          body=$(awk 'BEGIN { ORS = "" } {
+              gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "")
+              print (NR > 1 ? "\\n" : "") $0
+            }' notes.md)
+          payload="{\"tag_name\":\"${TAG}\",\"name\":\"nimbus ${TAG}\",\"body\":\"${body}\"}"
+
+          code=$(curl -sS -o release.json -w '%{http_code}' -H "$auth" "$api/releases/tags/${TAG}")
+          if [ "$code" = 200 ]; then
+            id=$(grep -o '"id":[0-9]*' release.json | head -n1 | cut -d: -f2)
+            echo "updating existing release $id"
+            curl -fsS -X PATCH "$api/releases/${id}" \
+              -H "$auth" -H 'Content-Type: application/json' -d "$payload" >/dev/null
+            # Replace every asset so binaries and SHA256SUMS always match.
+            for aid in $(curl -fsS -H "$auth" "$api/releases/${id}/assets" | grep -o '"id":[0-9]*' | cut -d: -f2); do
+              curl -fsS -X DELETE -H "$auth" "$api/releases/${id}/assets/${aid}"
+              echo "deleted asset $aid"
+            done
+          else
+            resp=$(curl -fsS -X POST "$api/releases" \
+              -H "$auth" -H 'Content-Type: application/json' -d "$payload")
+            id=$(printf '%s' "$resp" | grep -o '"id":[0-9]*' | head -n1 | cut -d: -f2)
+            [ -n "$id" ] || { echo "release creation failed: $resp"; exit 1; }
+            echo "created release $id"
+          fi
+
           for f in dist/*; do
             curl -fsS -X POST "$api/releases/${id}/assets?name=$(basename "$f")" \
-              -H "Authorization: token ${TOKEN}" -F "attachment=@${f}" >/dev/null
+              -H "$auth" -F "attachment=@${f}" >/dev/null
             echo "uploaded $(basename "$f")"
           done

@@ -217,7 +217,7 @@ func run() int {
 				argv = append(argv, "-F", *sshCfg)
 			}
 			if *conns <= 0 && nconns > 1 && !transport.BatchModeWorks(ctx, argv, rs.Dest()) {
-				u.Warn("ssh needs interactive authentication: using a single connection (set -c N to override)")
+				u.Warn("ssh needs interactive authentication: using a single connection (set --conns N to override)")
 				nconns = 1
 			}
 			remote, err = transport.NewSystem(ctx, argv, rs.Dest(), transport.SystemOptions{Conns: nconns, ID: id, Port: *port, Identity: *ident, Logf: logf})

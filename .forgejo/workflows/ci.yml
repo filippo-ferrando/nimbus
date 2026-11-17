@@ -1,0 +1,123 @@
+# Continuous integration: formatting, vet, unit tests (with the race
+# detector), cross-compilation for every release target and the end-to-end
+# suite. Uses only git/go/apt (no JavaScript actions), so it runs in the plain
+# golang image.
+name: ci
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+env:
+  SERVER: ${{ github.server_url }}
+  REPO: ${{ github.repository }}
+  REF: ${{ github.ref }}
+  TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.27
+    steps:
+      - name: Checkout
+        run: |
+          git init -q src
+          cd src
+          git fetch -q --depth 1 \
+            "$(echo "$SERVER" | sed "s#://#://oauth2:${TOKEN}@#")/${REPO}.git" "$REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%h %s'
+
+      - name: gofmt
+        working-directory: src
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"; echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: src
+        run: go vet ./...
+
+      - name: go mod tidy
+        working-directory: src
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.27
+    steps:
+      - name: Checkout
+        run: |
+          git init -q src
+          cd src
+          git fetch -q --depth 1 \
+            "$(echo "$SERVER" | sed "s#://#://oauth2:${TOKEN}@#")/${REPO}.git" "$REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%h %s'
+
+      - name: Unit tests
+        working-directory: src
+        run: go test -race -count=1 ./...
+
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.27
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout
+        run: |
+          git init -q src
+          cd src
+          git fetch -q --depth 1 \
+            "$(echo "$SERVER" | sed "s#://#://oauth2:${TOKEN}@#")/${REPO}.git" "$REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%h %s'
+
+      - name: Cross-compile
+        working-directory: src
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 freebsd/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null . || exit 1
+            echo "ok $target"
+          done
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [test]
+    container:
+      image: golang:1.27
+    steps:
+      - name: Checkout
+        run: |
+          git init -q src
+          cd src
+          git fetch -q --depth 1 \
+            "$(echo "$SERVER" | sed "s#://#://oauth2:${TOKEN}@#")/${REPO}.git" "$REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%h %s'
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            openssh-server openssh-client zstd libarchive-tools >/dev/null
+
+      # The suite starts its own unprivileged sshd and checks permission
+      # errors, which root would bypass: run it as a regular user.
+      - name: End-to-end tests
+        run: |
+          useradd -m e2e
+          chown -R e2e src
+          su e2e -s /bin/bash -c "cd src && PATH='$PATH' GOPATH=/home/e2e/go GOCACHE=/home/e2e/.cache/go-build test/e2e.sh"
