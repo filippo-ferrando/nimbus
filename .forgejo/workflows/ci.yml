@@ -4,11 +4,27 @@
 # golang image.
 name: ci
 
+# Only run when something that can change the build or test outcome is
+# touched; docs, README, CHANGELOG, LICENSE and images are skipped.
 on:
   push:
     branches:
       - "**"
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "test/**"
+      - ".forgejo/workflows/ci.yml"
   pull_request:
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "test/**"
+      - ".forgejo/workflows/ci.yml"
 
 env:
   SERVER: ${{ github.server_url }}
